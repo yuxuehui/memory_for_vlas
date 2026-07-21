@@ -306,11 +306,7 @@ aborts on mismatch. (There is **no** `--control-mode` flag in this repo.)
 | read-out n_q=4 (HAMLET) | 24.5 | 17.0 | 21.5 | 10.5 | **18.4** |
 | read-out n_q=128 | 29.5 | 15.0 | 17.0 | 13.0 | **18.6** |
 | raw image tokens (FrameSamp) | 8.5 | 11.0 | 14.5 | **15.5** | 12.4 |
-| **Multi-resolution memory** @60k | 7.0 | **17.5** | 14.5 | 5.5 | **11.1** |
-| ├ @50k | 6.0 | 14.5 | 12.5 | 7.5 | 10.1 |
-| └ @40k | 2.0 | 6.0 | 7.0 | 6.0 | 5.2 |
-| *(ablation)* no fusion — two parallel channels | 7.0 | 11.0 | 13.0 | 5.5 | 9.1 |
-| *(ref)* mamba aggregator @40k ⚠️undertrained | 17.0 | 10.5 | 13.0 | 5.5 | 11.5 |
+| **Multi-resolution memory** | 7.0 | **17.5** | 14.5 | 5.5 | **11.1** |
 
 *Read-out wins the aggregate suites; raw tokens win Imitation — the low-pass ceiling.*
 
@@ -324,6 +320,8 @@ the classic gradient-competition failure), but it stays under FrameSamp 12.4 / r
 Reading: the fusion fixes **frame aliasing** (episode-spanning frames were previously indistinguishable to
 the policy), not the deeper problem that the two channels still compete for the same gradient budget. It
 also trains slowly — 5.2 → 10.1 → 11.1 across 40k/50k/60k, i.e. still climbing at the end of the run.
+(Reference point: the `mamba` selective-SSM aggregator reaches 11.5 % but only @40k of 60k — undertrained,
+not directly comparable.)
 (n_q=4 K=16-linspace `mamba` is **not** directly comparable to the K=4-recent 18.4.)
 
 ### 5b. Keyframe-selection A/B (all @60k, 16 tasks × 50 eps = 800 episodes each)
