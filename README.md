@@ -1,13 +1,29 @@
-# Memory for VLAs — Methods & How to Run (GR00T-N1.6 / HAMLET on RoboMME)
+# Memory for VLAs
 
-Long-horizon manipulation is a **POMDP**: the policy must condition on *history*, not just the current
-observation. This repo implements a family of **memory representations** for the GR00T-N1.6 VLA — each
-reuses the trajectory's temporal context as an extra input to the action head — and the **RoboMME**
-benchmark to measure when they help.
+**Memory representations for vision-language-action models** — implemented on GR00T-N1.6 and measured on
+the **RoboMME** long-horizon benchmark.
 
-This doc catalogs every memory method, maps each to the taxonomy in
-[`0_proposal_memory_of_vlas.md`](../Markdown/0_proposal_memory_of_vlas.md), and gives a verified, copy-paste
-command for each. Architecture detail lives in the code (pointers in [Code map](#code-map)).
+VLAs are **single-frame reactive policies**: GR00T-N1.6 and π₀.₅ both take an observation horizon of **1**
+(`delta_indices=[0]` — one frame per camera). Long-horizon manipulation, however, is a **POMDP**: the policy
+must condition on *history*. Every method here answers the same question differently — **what to remember,
+and how to feed it to the action head** — under a *fixed token budget*.
+
+The cost of having no memory is large and measurable: **8.2 %** (no memory) → **17.2 %** (compressed
+read-out) overall success on RoboMME. But no single memory wins everywhere — the best method changes with
+the *task semantics* (counting vs. occlusion vs. trajectory imitation), which is the main empirical result
+of this repo ([§5b](#5b-keyframe-selection-ab-all-60k-16-tasks--50-eps--800-episodes-each)).
+
+**Methods at a glance** — five trained arms, all from one codebase, selected by config flags
+([§0](#0-method-index-quick-reference)): `vanilla` · `HAMLET` read-out (compressed) ·
+**keyframe selection** in three flavors — `FrameSamp` (uniform) → `TokenDrop` (observation change) →
+`Action-conditioned patch memory` (novelty ∪ action-relevance) · `Multi-resolution memory` (read-out fused
+into image tokens).
+
+This README catalogs every method and gives a verified, copy-paste command for each. Architecture detail lives in the code (pointers in [Code map](#code-map)).
+
+> Built on [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T) N1.6 and the
+> [HAMLET](https://github.com/myungkyuKoo/HAMLET-Isaac-GR00T-N1d6) fork (Apache-2.0); the memory methods,
+> keyframe selection, and RoboMME evaluation harness here are this project's contribution.
 
 ---
 
@@ -29,7 +45,7 @@ codebase** — a method is a combination of config flags, not a branch.
 与 `--mem-cond-type`（记忆怎么注入 DiT）正交。
 ---
 
-## 1. The idea (from the proposal)
+## 1. The idea
 
 A memory is formed from a **history sequence** (raw vision tokens / text tokens / a learned read-out token),
 optionally **condensed**, then fed to the action expert. Methods differ in **what** they take as history and
@@ -74,7 +90,7 @@ into the action head*). The two axes are **orthogonal** — any memory pairs wit
 |---|---|---|---|---|
 | **Read-out (HAMLET)** | ② read-out summary | K past sets of `n_q` learnable moment tokens, compressed by the aggregator → a low-pass (DC) summary of the history | `--n-moment-tokens <n_q>` | ✅ main recipe (~18.4) |
 | **FrameSamp (raw tokens)** | ① raw tokens | F episode-spanning frames' **raw vision patch tokens** (≤ budget) — uncompressed spatial/temporal detail | `--mem-source framesamp --mem-framesamp-frames 8 --mem-framesamp-budget 512` | ✅ |
-| **Multi-resolution memory** (hybrid) | ①+② the proposed fix | **both at once**: read-out (`h_sem`) **+** raw framesamp (`h_spatial`, zero-init per-block spatial cross-attn), with each frame's tokens **colored by its own memory state** (block-causal, zero-init proj) so repeated frames are no longer aliased | `--mem-cond-type dual --mem-fs-inject moment --mem-framesamp-frames 8` | ✅ @60k **11.1 %** (§5a; `../Markdown/16_memory_into_image_tokens.md`) |
+| **Multi-resolution memory** (hybrid) | ①+② the proposed fix | **both at once**: read-out (`h_sem`) **+** raw framesamp (`h_spatial`, zero-init per-block spatial cross-attn), with each frame's tokens **colored by its own memory state** (block-causal, zero-init proj) so repeated frames are no longer aliased | `--mem-cond-type dual --mem-fs-inject moment --mem-framesamp-frames 8` | ✅ @60k **11.1 %** (§5a) |
 
 ### (1b) Keyframe selection — *which frames/patches enter the fixed budget*
 
@@ -95,8 +111,7 @@ which is historically mismatched — see caveats):
   sampling turns out to be the *correct prior for continuous manner*, not a naive baseline (§5b).
 - **2 → 3** drops the selection unit from frames to **patches** and adds a second, *task-conditioned*
   channel: the policy's own action queries vote on which patches matter. At the same 512-token budget a
-  patch-level union spans ~120 timesteps instead of 8 frames. Design + probe evidence:
-  [`../Markdown/21_patch_union_memory.md`](../Markdown/21_patch_union_memory.md).
+  patch-level union spans ~120 timesteps instead of 8 frames.
 
 - **Read-out size** — set by `--n-moment-tokens` (`n_q`): **4** (light; the ~18.4 baseline) or **128** (wide
   bank; tests token-count vs the pooling ceiling — scaling 32× barely helps, so the limit is the *pooling op*).
@@ -182,7 +197,7 @@ integration `--mem-cond-type adaln` or `--mem-cond-type modul` instead of cross_
 pretraining before the finetune above — FrameSamp and Multi-resolution memory have no TCL stage.
 
 > **Note — recommended: skip Stage 1.** Just train Method 1 directly from **random** moment-token init (the
-> command above). Per the proposal, the read-out summarizes the history nearly identically regardless of
+> command above). The read-out summarizes the history nearly identically regardless of
 > initialization (random vs TCL), because the attention pooling is dominated by the VLM's pretrained keys
 > `k_t`, not by the query `q`. So Stage 1 is not needed in practice; treat the TCL chain below as optional.
 
@@ -311,7 +326,7 @@ the policy), not the deeper problem that the two channels still compete for the 
 also trains slowly — 5.2 → 10.1 → 11.1 across 40k/50k/60k, i.e. still climbing at the end of the run.
 (n_q=4 K=16-linspace `mamba` is **not** directly comparable to the K=4-recent 18.4.)
 
-### 5b. Keyframe-selection A/B (2026-07-21, all @60k, 16 tasks × 50 eps = 800 episodes each)
+### 5b. Keyframe-selection A/B (all @60k, 16 tasks × 50 eps = 800 episodes each)
 
 Measured on the *same* pipeline; the three memory arms share K=8 / budget 512 / `cross_attn`, so
 framesamp↔tokendrop isolates **selection only**. (vanilla = K=4 no-memory control.)
@@ -339,12 +354,39 @@ win pattern tracks the *instruction semantics*:
 
 **tokendrop suite split is significant in both directions**: Counting +11.0 (z=+3.17), Permanence +8.5
 (z=+2.36), Reference −6.5 (z=−2.06), Imitation −6.5 (z=−1.98); OVERALL +1.6 is **not** significant (z=0.96).
-Full tables/raw data: [`../Markdown/20_tokendrop.md`](../Markdown/20_tokendrop.md),
-`/tmp/robomme_eval/eval_tokendrop60k.log`.
+Per-task numbers: [§5c](#5c-per-task-results-with-instructions).
 
 ⇒ **No single selection rule dominates**; uniform sampling is the correct prior for *continuous* content and
 diff is the correct prior for *event* content — motivating a hybrid budget (diff peaks + uniform + compressed
 drift) rather than an either/or.
+
+---
+
+### 5c. Per-task results (with instructions)
+
+Same runs as §5b. The **example instruction** column is what makes the pattern legible: the winning memory
+tracks the *semantics of the task*, not a single global ranking.
+
+| suite | task | vanilla | HAMLET | FrameSamp | TokenDrop | example instruction |
+|---|---|---:|---:|---:|---:|---|
+| Counting | **BinFill** | 8.0 | **24.0** | 6.0 | 18.0 | put one red cube into the bin, then press the button to stop |
+| Counting | **PickXtimes** | 20.0 | **38.0** | 4.0 | 24.0 | pick up the green cube and place it on the target, repeating this action **three times**, then press the button to stop |
+| Counting | **StopCube** | **10.0** | 8.0 | **10.0** | 8.0 | press the button to stop the cube just as it reaches the target for the **fourth time** |
+| Counting | **SwingXtimes** | 14.0 | **32.0** | 14.0 | 28.0 | move the cube right-side → left-side target, repeating **two times**, finally press the button to stop |
+| Permanence | **ButtonUnmask** | 4.0 | **20.0** | 6.0 | 12.0 | first press the button, then pick up the container **hiding the red cube** |
+| Permanence | **ButtonUnmaskSwap** | 0.0 | **16.0** | 0.0 | 0.0 | press both buttons, then pick up the container hiding the blue cube, finally another hiding the green cube |
+| Permanence | **VideoUnmask** | 10.0 | 14.0 | 24.0 | **46.0** | watch the video carefully, then pick up the container hiding the green cube |
+| Permanence | **VideoUnmaskSwap** | 6.0 | **22.0** | 14.0 | 20.0 | watch the video, pick up the container hiding the green cube, finally another hiding the blue cube |
+| Reference | **PickHighlight** | 6.0 | **16.0** | 6.0 | 8.0 | first press the button, then pick up all cubes that **have been highlighted** with white areas |
+| Reference | **VideoPlaceButton** | 16.0 | **26.0** | **26.0** | 16.0 | watch the video, then place the green cube on the target **right after the button was pressed** |
+| Reference | **VideoPlaceOrder** | 20.0 | 20.0 | **24.0** | 8.0 | watch the video, then place the red cube on the **first** target it was previously placed on |
+| Reference | **VideoRepick** | 0.0 | **10.0** | 2.0 | 0.0 | watch the video, repeatedly pick up/put down the **same block** three times, finally press the button |
+| Imitation | **InsertPeg** | 0.0 | **4.0** | 0.0 | 2.0 | watch the video, grasp the **same end of the same peg** and insert into the **same side** of the box |
+| Imitation | **MoveCube** | 12.0 | 18.0 | 14.0 | **24.0** | watch the video, then move the cube to the target **in the same manner as before** |
+| Imitation | **PatternLock** | 0.0 | 4.0 | **14.0** | 6.0 | watch the video, then use the stick to **retrace the same pattern** |
+| Imitation | **RouteStick** | 6.0 | 4.0 | **34.0** | 4.0 | watch the video, then navigate around the sticks **following the same path** |
+
+Per-task winners: HAMLET 10 · FrameSamp 5 · TokenDrop 2 · vanilla 1 (ties counted for each).
 
 ---
 
@@ -413,7 +455,6 @@ drift) rather than an either/or.
 | Train scripts | `run_scripts/{train_vanilla_n1d6,train_tcl_stage1,train_hamlet_n1d6,train_tokendrop_n1d6}.sh` |
 | Eval (serve + RoboMME rollout + aggregate) | `run_scripts/eval_n1d6.sh`, `gr00t/eval/sim/robomme/` |
 
-*Proposal & theory:* [`../Markdown/0_proposal_memory_of_vlas.md`](../Markdown/0_proposal_memory_of_vlas.md) ·
-selection theory [`20_memory_theory.md`](../Markdown/20_memory_theory.md) ·
-tokendrop [`20_tokendrop.md`](../Markdown/20_tokendrop.md) ·
-patch_union [`21_patch_union_memory.md`](../Markdown/21_patch_union_memory.md).
+*Selection theory (Bayes-filter view: drift vs. correction, why single-channel scores are blind to the
+orthogonal channel, and why deterministic-given-action content cannot be selected at all) is developed in
+the project's research notes, kept outside this repo.*
