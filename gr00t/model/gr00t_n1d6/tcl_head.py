@@ -28,21 +28,39 @@ class Gr00tN1d6TCLHead(nn.Module):
 
     supports_gradient_checkpointing = False
 
-    def __init__(self, backbone_embedding_dim: int, tcl_tau: float = 0.07):
+    def __init__(
+        self,
+        backbone_embedding_dim: int,
+        tcl_tau: float = 0.07,
+        no_projection_head: bool = False,
+    ):
         super().__init__()
         d = backbone_embedding_dim
         # 2-layer Linear(d->d) + SiLU + Linear(d->d); L2 normalization is applied at
         # forward via F.normalize.
-        self.moment_to_repr = nn.Sequential(
-            nn.Linear(d, d),
-            nn.SiLU(),
-            nn.Linear(d, d),
-        )
-        for m in self.moment_to_repr.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # bias=False: under HF from_pretrained(low_cpu_mem_usage) these "newly
+        # initialized" params are materialized from meta device via _init_weights,
+        # which sets the Linear WEIGHT but leaves the BIAS as uninitialized (NaN)
+        # memory -> NaN loss on the very first step. A contrastive head after
+        # L2-normalize doesn't need biases, so drop them entirely.
+        # no_projection_head=True (config --tcl-no-projection-head) -> drop the head
+        # entirely: the InfoNCE is then computed directly on the pooled moment-token
+        # representation, so the ONLY trainable path is the moment tokens (no head to
+        # absorb the contrastive signal).
+        self._no_mlp = bool(no_projection_head)
+        if self._no_mlp:
+            self.moment_to_repr = nn.Identity()
+        else:
+            self.moment_to_repr = nn.Sequential(
+                nn.Linear(d, d, bias=False),
+                nn.SiLU(),
+                nn.Linear(d, d, bias=False),
+            )
+            for m in self.moment_to_repr.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
         self.tcl_tau = tcl_tau
         self.mask_token = None  # stub for trainer compatibility
 
@@ -61,10 +79,22 @@ class Gr00tN1d6TCLHead(nn.Module):
         feats = backbone_output["backbone_features"]  # (B, T, d)
         n_q = int(backbone_output["n_moment_tokens"])
         mq = feats[:, -n_q:, :]
-        pooled = mq.mean(dim=1)
-        # Cast to the projection MLP's dtype for autocast cleanliness.
-        proj_dtype = next(self.moment_to_repr.parameters()).dtype
-        z = self.moment_to_repr(pooled.to(proj_dtype))
+        pooled = mq.mean(dim=1).float()  # everything below in fp32 for stability
+        # Bound the MLP INPUT scale: `pooled` is the frozen 2B-VLM's last-layer hidden
+        # state, whose magnitude is large/unbounded -> exploding bias gradients in the
+        # first steps -> moment_to_repr biases -> Inf -> constant z -> loss collapses to
+        # ln2 with zero gradient (observed). RMS-normalizing the input keeps it O(1) so
+        # the projection + InfoNCE stay stable. (fp32 cosine-sim/CE also required: bf16 +
+        # tau=0.07 + L2-norm saturates the softmax and gives NaN grads.)
+        pooled = pooled / (pooled.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt())
+        if self._no_mlp:
+            # No head: InfoNCE directly on the pooled moment-token representation (fp32).
+            z = pooled.float()
+        else:
+            # Cast back to the MLP's dtype for the matmul (DeepSpeed has no autocast, so a
+            # fp32 input vs bf16 weights would mismatch); take the cosine-sim / InfoNCE in fp32.
+            proj_dtype = next(self.moment_to_repr.parameters()).dtype
+            z = self.moment_to_repr(pooled.to(proj_dtype)).float()
         z = F.normalize(z, dim=-1, eps=1e-8)
         return z
 

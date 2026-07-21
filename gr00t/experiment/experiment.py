@@ -177,6 +177,15 @@ def run(config: Config):
     processor = pipeline.return_processor()
     processor.save_pretrained(processor_dir)
 
+    # DEBUG: locate the FIRST module to emit a NaN/Inf (forward or backward). Gated on env so it
+    # is a no-op for normal runs. DEBUG_ANOMALY=1 additionally turns on autograd anomaly mode.
+    if os.environ.get("DEBUG_NAN"):
+        from gr00t.model.modules.nan_probe import install_nan_probe
+        install_nan_probe(model)
+        if os.environ.get("DEBUG_ANOMALY"):
+            torch.autograd.set_detect_anomaly(True)
+            logging.warning("[DEBUG] autograd anomaly detection ON (~10x slower)")
+
     # deepspeed config
     if config.training.num_gpus > 1 and not config.training.use_ddp:
         deepspeed_config = config.get_deepspeed_config()
@@ -204,6 +213,8 @@ def run(config: Config):
         logging_steps=config.training.logging_steps,
         save_steps=config.training.save_steps,
         save_total_limit=config.training.save_total_limit,
+        save_only_model=True,  # checkpoints = model weights only (no optimizer) -> ~7GB not ~35GB,
+                               # so frequent (every 2k) checkpoints fit on disk for overfit-curve eval
         fp16=config.training.fp16,
         bf16=config.training.bf16,
         tf32=config.training.tf32,
@@ -239,6 +250,23 @@ def run(config: Config):
             processor_dir=processor_dir,
         )
     )
+
+    # HAMLET-TCL probe (env-gated, zero impact on normal runs): dump the moment_tokens at
+    # init (on_train_begin = step 0, rank 0) so we can measure how far TCL moves them.
+    _init_dump = os.environ.get("HAMLET_DUMP_INIT_TOKENS")
+    if _init_dump:
+        from transformers import TrainerCallback
+
+        class _MomentInitDump(TrainerCallback):
+            def on_train_begin(self, args, state, control, **kw):
+                m = kw.get("model")
+                bb = getattr(m, "backbone", None)
+                mt = getattr(bb, "moment_tokens", None) if bb is not None else None
+                if mt is not None and int(os.environ.get("RANK", "0")) == 0:
+                    torch.save(mt.detach().float().cpu(), _init_dump)
+                    print(f"[HAMLET-TCL] dumped init moment_tokens -> {_init_dump}")
+
+        trainer.add_callback(_MomentInitDump())
 
     if config.training.save_best_eval_metric_name != "":
         trainer.add_callback(

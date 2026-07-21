@@ -10,6 +10,62 @@ from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStep
 from .lerobot_episode_loader import LeRobotEpisodeLoader
 
 
+FS_DIFF_SCORE_ATTR = "_fs_diff_scores"
+
+
+def _fs_diff_scores(
+    episode_data: pd.DataFrame, video_cols: list[str], stride: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frame-level TokenDrop scores for one episode, memoized on `episode_data.attrs`.
+
+    Mirrors RoboMME mem_buffer.py `_process_token_drop_score` at frame level (and the
+    inference-side DiffFrameSelector): scored steps are multiples of `stride`; each score
+    is the mean |pixel diff| against the PREVIOUS SCORED step, averaged over views.
+    Computed once per episode load (get_shard reuses the DataFrame across its samples).
+    """
+    key = f"{FS_DIFF_SCORE_ATTR}::{stride}"
+    cached = episode_data.attrs.get(key)
+    if cached is not None:
+        return cached
+    T = len(episode_data)
+    steps, scores = [], []
+    prev = [
+        np.asarray(episode_data[c].iloc[0], dtype=np.float32) for c in video_cols
+    ]
+    for t in range(stride, T, stride):
+        cur = [np.asarray(episode_data[c].iloc[t], dtype=np.float32) for c in video_cols]
+        score = float(
+            np.mean([np.abs(c_ - p_).mean() for c_, p_ in zip(cur, prev)])
+        )
+        steps.append(t)
+        scores.append(score)
+        prev = cur
+    out = (np.asarray(steps, dtype=int), np.asarray(scores, dtype=np.float32))
+    episode_data.attrs[key] = out
+    return out
+
+
+def _fs_diff_indices(
+    steps: np.ndarray, scores: np.ndarray, anchor: int, fs_frames: int
+) -> list[int]:
+    """CAUSAL TokenDrop keyframe indices: frame 0 + top-(F-2) scored steps <= anchor +
+    the anchor frame, right-padded by repeating the anchor to exactly F frames — the
+    same layout the inference DiffFrameSelector.read() emits (temporal order, current
+    frame last). Unlike the linspace path this never touches frames after `anchor`."""
+    mask = steps <= anchor
+    s, sc = steps[mask], scores[mask]
+    k = max(0, fs_frames - 2)
+    if len(s) > k:
+        keep = s[np.argsort(sc)[::-1][:k]]
+    else:
+        keep = s
+    idxs = sorted({0} | {int(x) for x in keep if int(x) != anchor})[: fs_frames - 1]
+    idxs.append(anchor)
+    while len(idxs) < fs_frames:
+        idxs.append(anchor)
+    return idxs[:fs_frames]
+
+
 def extract_step_data(
     episode_data: pd.DataFrame,
     step_index: int,
@@ -64,6 +120,40 @@ def extract_step_data(
                 indices_to_load = [max(0, min(idx, traj_len - 1)) for idx in indices_to_load]
         elif allow_padding:
             indices_to_load = [max(0, min(idx, traj_len - 1)) for idx in indices_to_load]
+
+        # HAMLET episode-spanning moment (mem_window_mode='linspace'): replace the recent-stride
+        # K-window with a CAUSAL even-`linspace` over the history-so-far [0, anchor] (past only,
+        # so training matches the online inference cache). Video modality only; K = len(delta_indices).
+        if modality == "video" and getattr(config, "mem_window_mode", "recent") == "linspace":
+            anchor = max(0, min(step_index, traj_len - 1))
+            K = len(config.delta_indices)
+            indices_to_load = np.linspace(0, anchor, num=K).round().astype(int).tolist()
+
+        # HAMLET mem_source='framesamp': append episode-spanning linspace frames to the
+        # video stream (AFTER the K-step memory-window frames). These give the per-block
+        # MemoryFiLM raw vision tokens that span the WHOLE episode, not just the K-window.
+        # framesamp_frames defaults to 0 -> this block is a no-op for every other config.
+        fs_frames = int(getattr(config, "framesamp_frames", 0)) if modality == "video" else 0
+        if fs_frames > 0:
+            if getattr(config, "framesamp_select", "linspace") == "diff":
+                # TokenDrop-style CAUSAL keyframes (frame 0 + top-diff <= anchor + anchor),
+                # matching the inference DiffFrameSelector — unlike the linspace path below,
+                # which is acausal (spans the whole episode incl. future frames).
+                anchor = max(0, min(step_index, traj_len - 1))
+                video_cols = [
+                    f"{modality}.{k}"
+                    for k in config.modality_keys
+                    if f"{modality}.{k}" in episode_data.columns
+                ]
+                fs_stride = int(getattr(config, "framesamp_diff_stride", 8))
+                steps, scores = _fs_diff_scores(episode_data, video_cols, fs_stride)
+                episode_idxs = _fs_diff_indices(steps, scores, anchor, fs_frames)
+            else:
+                episode_idxs = (
+                    np.linspace(0, traj_len - 1, num=fs_frames).round().astype(int).tolist()
+                )
+            indices_to_load = list(indices_to_load) + episode_idxs
+
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]

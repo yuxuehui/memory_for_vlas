@@ -384,6 +384,15 @@ class LeRobotEpisodeLoader:
                 f"Original key {original_key} not found in feature config"
             )
 
+            # LeRobot v2.1 stores image features as PNG bytes embedded in the parquet
+            # (feature dtype "image"), not as mp4 files. Decode those directly; only fall
+            # through to the mp4 path for true "video" dtype features.
+            if self.feature_config[original_key].get("dtype") == "image":
+                video_data[image_key] = self._decode_embedded_images(
+                    episode_index, original_key, indices
+                )
+                continue
+
             # Construct video file path using pattern
             video_filename = self.video_path_pattern.format(
                 episode_chunk=chunk_idx,
@@ -401,6 +410,38 @@ class LeRobotEpisodeLoader:
             )
 
         return video_data
+
+    def _decode_embedded_images(
+        self, episode_index: int, original_key: str, indices: np.ndarray
+    ) -> np.ndarray:
+        """Decode PNG-bytes image frames embedded in the parquet (LeRobot v2.1 `dtype: image`).
+
+        Returns (N, H, W, C) uint8 — the same shape/dtype get_frames_by_indices returns for
+        mp4 features, so downstream consumption is identical.
+        """
+        import io
+
+        from PIL import Image
+
+        chunk_idx = episode_index // self.chunk_size
+        parquet_filename = self.data_path_pattern.format(
+            episode_chunk=chunk_idx, episode_index=episode_index
+        )
+        col = pd.read_parquet(
+            self.dataset_path / parquet_filename, columns=[original_key]
+        )[original_key]
+        frames = []
+        for i in indices:
+            cell = col.iloc[int(i)]
+            if isinstance(cell, dict):
+                if cell.get("bytes") is not None:
+                    img = Image.open(io.BytesIO(cell["bytes"]))
+                else:
+                    img = Image.open(self.dataset_path / cell["path"])
+            else:  # raw bytes
+                img = Image.open(io.BytesIO(cell))
+            frames.append(np.asarray(img.convert("RGB"), dtype=np.uint8))
+        return np.stack(frames, axis=0)
 
     def _load_mask_file(self, mask_path: Path, indices: np.ndarray) -> np.ndarray:
         """Load masks from npz/npy file at specified indices."""

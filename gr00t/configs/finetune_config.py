@@ -39,6 +39,12 @@ class FinetuneConfig:
     tune_visual: bool = False
     """If True, fine-tune the visual encoder (e.g., ViT or CNN backbone)."""
 
+    tune_top_llm_layers: int = 4
+    """Number of top Eagle-LLM layers to keep trainable (base recipe: 4 = layers 12-15,
+    trained alongside the action head; lower LLM + vision tower stay frozen).
+    Stage-1 (TCL) MUST set this to 0: otherwise the (discarded) top LLM layers absorb the
+    contrastive task and the moment tokens barely move from init. Stage-2 keeps 4."""
+
     tune_projector: bool = True
     """If True, fine-tune the multimodal projector layers that map vision/language features to a shared space."""
 
@@ -94,7 +100,10 @@ class FinetuneConfig:
     """Number of parallel worker processes used for data loading."""
 
     learning_rate: float = 1e-4
-    """Initial learning rate for optimizer."""
+    """Initial learning rate for optimizer. Stage-1 (TCL): 2e-5; Stage-2: 1e-4."""
+
+    max_grad_norm: float = 1.0
+    """Gradient-clipping max norm. Stage-1 (TCL) uses 0.5 for InfoNCE stability."""
 
     gradient_accumulation_steps: int = 1
     """Number of forward passes to accumulate before performing a backward/update step."""
@@ -168,18 +177,149 @@ class FinetuneConfig:
     memory_num_layers: int = 2
     """Depth of the HAMLET memory transformer (paper default: 2)."""
 
-    mem_cond_type: Literal["cross_attn", "adaln"] = "cross_attn"
+    memory_arch: Literal["transformer", "gru", "ssm", "mamba"] = "transformer"
+    """Memory aggregator over the K-step moment-token history. "transformer" (default) =
+    block-causal attention MemoryTransformer; "gru"/"ssm"(S4D)/"mamba"(selective SSM) =
+    recurrent/state-space SequenceMemory that accumulates "what events happened" as a state."""
+    memory_hidden: int = 512
+    """SequenceMemory bottleneck width (gru/ssm/mamba only)."""
+    memory_state_dim: int = 64
+    """SSM state size per layer (ssm/mamba only)."""
+
+    memory_scales: str = ""
+    """MULTI-SCALE memory (V1, Markdown/10_multiscale_temporal_memory.md): comma-separated window
+    lengths, ascending (e.g. "2,8,16"). Runs one `memory_arch` aggregator per scale over the SUFFIX
+    of the K-step moment history and concatenates all scales' current read-outs into the KV tail
+    (masks grown like the framesamp M!=n_q path). max(scales) MUST equal memory_window (the loader
+    provides exactly K snapshots; shorter scales slice suffixes — no loader change). "" = off
+    (single-scale, byte-identical to the existing path)."""
+    memory_scales_uniform: bool = False
+    """Multi-scale only — append per-scale PARAMETER-FREE uniform-mean tokens (the one read-out with
+    a guaranteed Dirichlet/sinc response, cutoff ~ 1/K_l): +len(scales)*n_q KV tokens."""
+    memory_scales_dog: bool = False
+    """Multi-scale only — append adjacent-scale DIFFERENCE tokens (m_short - m_long). Zero DC gain
+    -> the only genuinely band-pass channel a simplex read-out bank can emit: +(L-1)*n_q tokens."""
+    memory_comm: bool = False
+    """Multi-scale V2 — coarse->fine communication (HKSL-style): each finer scale's read-out
+    cross-attends the next-coarser scale's read-out (zero-init output proj -> exact no-op at init)."""
+    memory_aux_lambda: float = 0.0
+    """Multi-scale V2 — weight of the per-scale BYOL predictive loss (0 = off). Each scale l
+    predicts the momentum-EMA read-out at t from its online read-out at t-h_l (short scale ->
+    near-term change, long scale -> slow state): the explicit signal that forces scales to
+    SPECIALIZE (window length alone does not pin the realized softmax spread)."""
+    memory_aux_horizons: str = ""
+    """Multi-scale V2 — comma-separated per-scale prediction horizons h_l (steps ahead). "" = auto:
+    h_l = min(max(1, K_l//2), K - K_l); scales with no room (K_l == K) are skipped (horizon
+    starvation — give the longest scale headroom by raising memory_window if you want it in)."""
+    memory_aux_warmup_steps: int = 2000
+    """Multi-scale V2 — linear warmup steps for the aux-loss weight (matches the zero-init
+    warm-start convention). Counted per training forward; not checkpointed (resume re-ramps)."""
+    memory_aux_ema: float = 0.996
+    """Multi-scale V2 — momentum of the fp32 EMA target encoder (BYOL non-collapse requires
+    EMA + stop-grad + online predictor, all three)."""
+    memory_aux_detach_moment: bool = False
+    """Multi-scale V2 — detach moment tokens for the ONLINE aux branch too, so the predictive loss
+    shapes only the memory modules (not the shared backbone moment tokens). Fallback knob if the
+    action loss regresses."""
+
+    mem_cond_type: Literal["cross_attn", "adaln", "modul", "dual"] = "cross_attn"
+    # v2b (note 16): dual-only framesamp injection — "none" | "te" | "moment".
+    mem_fs_inject: Literal["none", "te", "moment"] = "none"
     """How memory conditions the action head.
     - "cross_attn" (default): memory-aggregated moment tokens replace the backbone
       moment-token tail and enter the DiT as cross-attention KV.
     - "adaln": the pooled memory vector goes through a zero-init Linear and is added to
-      the DiT timestep embedding; the moment-token tail is sliced off the KV."""
+      the DiT timestep embedding; the moment-token tail is sliced off the KV.
+    - "modul" (MME-VLA style): the action tokens cross-attend to the full memory SEQUENCE
+      and FiLM-modulate per DiT block (zero-init -> identity at start); tail sliced off the KV.
+      Keeps selectivity (cross-attn) + high-amplitude injection (FiLM) — stronger than adaln.
+    - "dual" (HYBRID memory): TWO channels, each through its OWN cross-attention (separate
+      softmax — not concatenated, not FiLM). h_sem (DC) = the moment tokens on the action-head
+      KV tail, EXACTLY like 'cross_attn' (the 18.4 baseline, unchanged). h_spatial (AC) = raw
+      per-position framesamp tokens, consumed by a NEW per-block spatial cross-attn (residual-add,
+      zero-init output projection -> contributes 0 at init, so a fresh dual forward == the
+      moment-only baseline). Set mem_framesamp_frames>0 (loader appends the episode-spanning
+      frames) so the spatial channel sees whole-episode context."""
 
     memory_type: Literal["moment_token", "vision_feature"] = "moment_token"
     """What flows through the memory module (action-head VLM conditioning is unchanged).
     "moment_token": learnable moment tokens' post-LLM hidden states.
     "vision_feature": primary view (first modality_key) image tokens, post-LLM, avg-pooled
     to 64/step (no moment tokens added). Supports both mem_cond_type values."""
+
+    mem_film_layers: str = "all"
+    """`mem_cond_type='modul'` only — injection-DEPTH control: which DiT blocks get a
+    `MemoryFiLM`. Probes showed the every-block `modul` dumps 66-86% of memory->action
+    saliency into the SHALLOW first block (the worst injection depth). This restricts the
+    FiLM to a chosen depth band; blocks not selected get NO mem_film module (and skip the
+    apply), so there is no shallow block-0 dump. Spec forms:
+      - "all"            : every block (DEFAULT — exactly the current behavior).
+      - "mid"            : a mid-deep band ~[num_layers//4 .. 5*num_layers//8) (e.g. [8..20)
+                           of 32) — the empirically good injection depth.
+      - "8,10,12,14"     : an explicit comma-separated list of block indices.
+      - "8-20" / "8:20"  : a (start, end) half-open range.
+    Resolved against the DiT `num_layers` at model build."""
+
+    mem_window_mode: Literal["recent", "linspace"] = "recent"
+    """Moment-memory window sampling (mem_source='moment' only). "recent" (DEFAULT, current
+    behavior) = the recent-stride K-window (delta_indices = -(K-1-i)*stride). "linspace" =
+    CAUSAL episode-spanning: the K memory-window frames are even-`linspace` over the
+    history-so-far [0, current_step] (past only — train & inference identical, no FIFO
+    mismatch). Tests whether whole-episode coverage (vs a recent window) helps the compressed
+    moment memory. Orthogonal to mem_source; keep mem_source='moment'."""
+
+    mem_source: Literal["moment", "framesamp"] = "moment"
+    """`mem_cond_type='modul'` only — memory-RICHNESS control: what the per-block FiLM
+    cross-attends.
+      - "moment"    : the K x n_q compressed memory-transformer output `mq_memory_out`
+                      (16-32 learned tokens) — DEFAULT, exactly the current behavior.
+      - "framesamp" : MME-VLA-style — many RAW per-frame vision patch tokens spanning the
+                      window, even-`linspace` temporal sub-sampling, capped at
+                      `mem_framesamp_budget`. Feeds richer/rawer memory than the lossy
+                      moment-token summary. NOTE: spanning the WHOLE episode (vs the current
+                      K-frame/stride window) needs data-loader changes — see the model code /
+                      return notes for the remaining pipeline work."""
+
+    mem_framesamp_budget: int = 512
+    """`mem_source='framesamp'` only — max number of raw vision tokens fed to the FiLM
+    cross-attention (even `linspace` sub-sample of the available per-frame patch tokens).
+    MME-VLA reference uses up to 512."""
+
+    mem_fs_select: Literal["fifo", "diff", "patch_union"] = "fifo"
+    """`mem_source='framesamp'` frame-selection FAMILY. "fifo" (default) = current
+    behavior: acausal whole-episode linspace frames at train, recent-F FIFO at inference.
+    "diff" = TokenDrop-style pixel-difference keyframes at BOTH train (loader: causal
+    frame 0 + top-diff <= anchor + anchor) and inference (DiffFrameSelector; stamped into
+    the checkpoint's model config), so train/eval frame distributions match."""
+
+    mem_fs_diff_stride: int = 8
+    """Scoring cadence for mem_fs_select='diff' (TokenDrop stride; env steps at train,
+    policy calls at inference)."""
+
+    mem_fs_attn_layer: int = 13
+    """mem_fs_select='patch_union': DiT cross-attn layer whose action->patch attention is
+    the relevance channel (scored in a no_grad pass over the full candidate set)."""
+
+    mem_fs_diff_share: float = 0.5
+    """mem_fs_select='patch_union': novelty-channel share of the patch budget (rest = relevance)."""
+
+    mem_framesamp_frames: int = 8
+    """`mem_source='framesamp'` only — number of EPISODE-SPANNING video frames the loader
+    even-`linspace`-samples across the WHOLE episode (independent of the K-step
+    memory_window/stride). These frames are appended AFTER the K-step memory-window frames
+    in the SAME video stream, run through the backbone vision encoder, and their raw patch
+    tokens (linspace sub-sampled to `mem_framesamp_budget`) feed the per-block MemoryFiLM as
+    `mem_seq`. Ignored unless `mem_source='framesamp'` (and `mem_cond_type='modul'`)."""
+
+    mem_image_side: bool = False
+    """`mem_cond_type='cross_attn'` only — cross-attn ROUTING control for the memory tokens
+    that ride the action-head KV. The DiT splits cross-attn blocks into an IMAGE pathway
+    (attends tokens with `image_mask=True`) and a TEXT pathway (`image_mask=False`).
+      - False (DEFAULT — exactly the current behavior): memory tokens (moment tail or
+              framesamp tokens) are tagged `image_mask=False` -> TEXT pathway.
+      - True : memory tokens are tagged `image_mask=True` -> IMAGE pathway instead.
+    Only affects the cross_attn paths; modul/adaln slice the moment tail off the KV so they
+    are unaffected."""
 
     load_moment_tokens_from: str | None = None
     """Stage-2 entry. Path to a Stage-1 (TCL) checkpoint or `model.safetensors`
@@ -190,4 +330,10 @@ class FinetuneConfig:
 
     tcl_tau: float = 0.07
     """InfoNCE temperature for the TCL stage."""
+
+    tcl_no_projection_head: bool = False
+    """Stage-1 (TCL) only. Drop the `moment_to_repr` projection head (use Identity) and
+    compute the InfoNCE directly on the pooled moment-token representation, so the moment
+    tokens are the ONLY trainable path — nothing downstream can absorb the contrastive
+    signal. Ignored outside `--hamlet-mode tcl`."""
 

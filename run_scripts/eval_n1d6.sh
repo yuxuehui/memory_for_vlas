@@ -33,7 +33,8 @@ TASKS=(BinFill PickXtimes SwingXtimes StopCube
        MoveCube InsertPeg PatternLock RouteStick)
 
 run_task() {
-    local task="$1" out="$OUTPUT_DIR/$task"
+    local task="$1"
+    local out="$OUTPUT_DIR/$task"
     mkdir -p "$out"
     echo "[eval] robomme / $task  (port $PORT)"
     python gr00t/eval/run_gr00t_server.py \

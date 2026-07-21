@@ -103,6 +103,12 @@ class Gr00tPolicy(BasePolicy):
         # slot (action_head._vision_cache); isolate it per session exactly like
         # the moment-token cache.
         self._vision_session_cache: dict[str, torch.Tensor] = {}
+        # mem_cond_type='dual' keeps its h_spatial (framesamp) FIFO in yet another model slot
+        # (action_head._spatial_cache), isolated per session exactly like the moment/vision caches.
+        self._spatial_session_cache: dict[str, torch.Tensor] = {}
+        # mem_fs_select='diff': per-session DiffFrameSelector objects (bounded keyframe
+        # state), round-tripped through action_head._fs_state like the tensor caches.
+        self._fs_session_state: dict[str, Any] = {}
         # LRU bookkeeping: RoboMME-style rollouts mint a fresh session id per
         # episode, so finished sessions would otherwise accumulate GPU tensors
         # forever on a long-running server. Cap the number of live sessions.
@@ -373,10 +379,22 @@ class Gr00tPolicy(BasePolicy):
             if reset_memory_flags is None:
                 reset_memory_flags = [False] * B
 
-            is_vision = (
-                getattr(self.model.action_head, "memory_type", "moment_token")
-                == "vision_feature"
+            # `_vision_cache` is the relevant per-session state for two variants:
+            #   - memory_type="vision_feature" (pooled-64 primary-view FIFO), and
+            #   - mem_source="framesamp" (raw per-frame vision FIFO, which reuses the same
+            #     `_vision_cache` slot) for BOTH mem_cond_type="modul" (FiLM) and "cross_attn"
+            #     (KV). All must key "session has state" off the vision cache, NOT the
+            #     (never-populated) moment cache, otherwise effective_reset would be True every
+            #     call and the FIFO could not accumulate episode history.
+            ah = self.model.action_head
+            is_vision = getattr(ah, "memory_type", "moment_token") == "vision_feature" or (
+                getattr(ah, "mem_source", "moment") == "framesamp"
+                and getattr(ah, "mem_cond_type", "cross_attn") in ("modul", "cross_attn")
             )
+            # mem_cond_type='dual' keeps BOTH a moment FIFO (_memory_cache) AND a spatial FIFO
+            # (_spatial_cache); the spatial cache is the one that accumulates episode history, so
+            # key "session has state" off it (like is_vision does for the framesamp/vision cache).
+            is_dual = getattr(ah, "mem_cond_type", "cross_attn") == "dual"
             cached = [
                 None if reset_memory_flags[i] else self._memory_cache.get(session_ids[i])
                 for i in range(B)
@@ -403,9 +421,42 @@ class Gr00tPolicy(BasePolicy):
                 self.model.action_head._vision_cache = stacked_vis.to(self.model.device)
             else:
                 self.model.action_head._vision_cache = None
+            # mem_cond_type='dual': assemble the per-session h_spatial (framesamp) FIFO too.
+            cached_spatial = [
+                None if reset_memory_flags[i] else self._spatial_session_cache.get(session_ids[i])
+                for i in range(B)
+            ]
+            ref_spatial = next((c for c in cached_spatial if c is not None), None)
+            if ref_spatial is not None:
+                placeholder_spatial = torch.zeros_like(ref_spatial)
+                stacked_spatial = torch.stack(
+                    [c if c is not None else placeholder_spatial for c in cached_spatial], dim=0
+                )
+                self.model.action_head._spatial_cache = stacked_spatial.to(self.model.device)
+            else:
+                self.model.action_head._spatial_cache = None
+            # mem_fs_select='diff': load per-session diff-keyframe selector state (object
+            # list, not a stacked tensor). Reset slots get None -> the model creates a
+            # fresh selector; liveness/effective_reset still keys off the FIFO caches,
+            # which keep updating unconditionally in diff mode.
+            if getattr(ah, "mem_fs_select", "fifo") in ("diff", "patch_union"):
+                ah._fs_state = [
+                    None if reset_memory_flags[i] else self._fs_session_state.get(session_ids[i])
+                    for i in range(B)
+                ]
             # A sample resets when explicitly asked OR when the cache relevant to
             # this model variant has no per-session state yet.
-            relevant = cached_vis if is_vision else cached
+            if is_dual:
+                # dual runs BOTH a moment FIFO (_memory_cache, ALWAYS populated at K==1) and a
+                # spatial FIFO (_spatial_cache, gated on F>0 / n_img_sp>0). Key liveness off the
+                # MOMENT cache (with spatial fallback) — NOT the spatial cache alone: its extra
+                # guards can leave it None, wedging effective_reset True every step, which collapses
+                # the moment K-window to the current frame (active-but-memoryless == vanilla).
+                relevant = [
+                    cached[i] if cached[i] is not None else cached_spatial[i] for i in range(B)
+                ]
+            else:
+                relevant = cached_vis if is_vision else cached
             effective_reset = [
                 bool(reset_memory_flags[i] or relevant[i] is None) for i in range(B)
             ]
@@ -431,9 +482,20 @@ class Gr00tPolicy(BasePolicy):
             if new_cached_vis is not None:
                 for i, sid in enumerate(session_ids):
                     self._vision_session_cache[sid] = new_cached_vis[i].detach().clone()
+            new_cached_spatial = getattr(self.model.action_head, "_spatial_cache", None)
+            if new_cached_spatial is not None:
+                for i, sid in enumerate(session_ids):
+                    self._spatial_session_cache[sid] = new_cached_spatial[i].detach().clone()
+            new_fs_state = getattr(self.model.action_head, "_fs_state", None)
+            if new_fs_state is not None:
+                for i, sid in enumerate(session_ids):
+                    if i < len(new_fs_state) and new_fs_state[i] is not None:
+                        self._fs_session_state[sid] = new_fs_state[i]
             # Reset model's caches so the next call rebuilds them from per-session storage.
             self.model.action_head._memory_cache = None
             self.model.action_head._vision_cache = None
+            self.model.action_head._spatial_cache = None
+            self.model.action_head._fs_state = None
             # Touch LRU order and evict sessions beyond the cap (oldest first).
             for sid in session_ids:
                 if sid in self._session_lru:
@@ -443,6 +505,8 @@ class Gr00tPolicy(BasePolicy):
                 stale = self._session_lru.pop(0)
                 self._memory_cache.pop(stale, None)
                 self._vision_session_cache.pop(stale, None)
+                self._spatial_session_cache.pop(stale, None)
+                self._fs_session_state.pop(stale, None)
 
         normalized_action = model_pred["action_pred"].float()
 

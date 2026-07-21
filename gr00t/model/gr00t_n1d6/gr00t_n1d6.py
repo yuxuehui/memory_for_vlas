@@ -1,3 +1,4 @@
+import os
 from typing import Any, Tuple
 
 from gr00t.configs.model.gr00t_n1d6 import Gr00tN1d6Config
@@ -51,17 +52,79 @@ class Gr00tN1d6ActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
+        # memory-as-modulator (mem_cond_type='modul'): the DiT action head cross-attends to the
+        # memory SEQUENCE and FiLM-modulates per layer (MME-VLA style). Enabled only with HAMLET memory.
+        _use_hamlet_mem = (
+            getattr(config, "hamlet_mode", "off") == "finetune"
+            and getattr(config, "memory_num_layers", 0) > 0
+        )
+        _mem_film_dim = (
+            config.backbone_embedding_dim
+            if (getattr(config, "mem_cond_type", "cross_attn") == "modul" and _use_hamlet_mem)
+            else None
+        )
+        # mem_cond_type='dual': the h_spatial (AC) channel rides a SEPARATE per-block spatial
+        # cross-attention over the raw framesamp tokens (backbone hidden dim). Set only for dual
+        # (and only with HAMLET memory) -> every other mode passes None and builds NO spatial
+        # module, so non-dual behavior is byte-identical.
+        _spatial_cross_attn_dim = (
+            config.backbone_embedding_dim
+            if (getattr(config, "mem_cond_type", "cross_attn") == "dual" and _use_hamlet_mem)
+            else None
+        )
+        # mem_cond_type='modul' depth/richness knobs (defaults reproduce current behavior).
+        _mem_film_layers = getattr(config, "mem_film_layers", "all")
+        self.mem_source = getattr(config, "mem_source", "moment")
+        self.mem_framesamp_budget = int(getattr(config, "mem_framesamp_budget", 512))
+        # mem_source='framesamp': number of episode-spanning frames the loader appends after
+        # the K-step memory-window frames (0 unless framesamp). Used to split the backbone
+        # rows: first memory_window rows = K-window (moment memory), last this-many rows =
+        # episode-spanning framesamp frames whose raw patch tokens build the mem_seq.
+        self.mem_framesamp_frames = int(getattr(config, "mem_framesamp_frames", 0))
+        # Inference-side framesamp frame SELECTION. "fifo" (default) = recent-F rolling
+        # window (current behavior); "diff" = TokenDrop-style pixel-difference keyframes
+        # (RoboMME mem_buffer.py, frame-level): frame 0 + top-(F-2) diff peaks + current.
+        # Motivation: the recent-FIFO loses demo/early events on long episodes while the
+        # training frames are episode-spanning (Markdown/vlm_keyframe_labels probe).
+        self.mem_fs_select = getattr(config, "mem_fs_select", "fifo")
+        self.mem_fs_diff_stride = int(getattr(config, "mem_fs_diff_stride", 8))
+        # mem_fs_select='patch_union' (probe: Markdown/patch_memory_labels): patch-level
+        # budget = diff top-(share) UNION action->image cross-attn top-(rest) at this layer.
+        self.mem_fs_attn_layer = int(getattr(config, "mem_fs_attn_layer", 13))
+        self.mem_fs_diff_share = float(getattr(config, "mem_fs_diff_share", 0.5))
+        # Per-session selector list at inference (DiffFrameSelector | PatchUnionSelector);
+        # Gr00tPolicy round-trips it across calls exactly like the FIFO caches.
+        self._fs_state: list | None = None
+        # patch_union two-pass scoring: pass A puts ALL candidate patch tokens in the KV and
+        # captures the DiT's action->patch cross-attention; pass B selects the union top-budget
+        # using those scores. `_pu_rel` holds (B, n_cand) relevance for pass B.
+        self._pu_score_pass: bool = False
+        self._pu_rel: torch.Tensor | None = None
+        # inference post-action write: [(selector, vis_current, kv_image_cols)] per batch item
+        self._pu_pending: list | None = None
+        # cross_attn ROUTING for the memory tokens that ride the action-head KV. False
+        # (default) -> image_mask=False (TEXT cross-attn pathway, current behavior); True ->
+        # image_mask=True (IMAGE cross-attn pathway). Only the cross_attn paths read this.
+        self.mem_image_side = bool(getattr(config, "mem_image_side", False))
+
         # Initialize components directly from config
         if config.use_alternate_vl_dit:
             self.model = AlternateVLDiT(
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
+                mem_cross_attention_dim=_mem_film_dim,
+                mem_film_layers=_mem_film_layers,
+                spatial_cross_attention_dim=_spatial_cross_attn_dim,
                 attend_text_every_n_blocks=config.attend_text_every_n_blocks,
             )
             print("Using AlternateVLDiT for diffusion model")
         else:
             self.model = DiT(
-                **config.diffusion_model_cfg, cross_attention_dim=config.backbone_embedding_dim
+                **config.diffusion_model_cfg,
+                cross_attention_dim=config.backbone_embedding_dim,
+                mem_cross_attention_dim=_mem_film_dim,
+                mem_film_layers=_mem_film_layers,
+                spatial_cross_attention_dim=_spatial_cross_attn_dim,
             )
             print("Using DiT for diffusion model")
         self.action_dim = config.max_action_dim
@@ -118,24 +181,112 @@ class Gr00tN1d6ActionHead(nn.Module):
         self._mem_tokens_per_step = (
             64 if self.memory_type == "vision_feature" else config.n_moment_tokens
         )
+        # MULTI-SCALE memory (V1/V2, Markdown/10_multiscale_temporal_memory.md): one aggregator per
+        # window length over suffix windows of the K-step history; "" = off (single-scale path).
+        from gr00t.model.modules.multiscale_memory import parse_int_list
+        self.memory_scales = parse_int_list(getattr(config, "memory_scales", ""))
         if self.use_hamlet and getattr(config, "memory_num_layers", 0) > 0:
-            self.memory_transformer = MemoryTransformer(
-                dim=config.backbone_embedding_dim,
-                n_q=self._mem_tokens_per_step,
-                T=config.memory_window,
-                num_layers=config.memory_num_layers,
-            )
+            mem_arch = getattr(config, "memory_arch", "transformer")
+            if self.memory_scales:
+                assert self.memory_scales[-1] == config.memory_window, (
+                    f"max(memory_scales)={self.memory_scales[-1]} must equal "
+                    f"memory_window={config.memory_window} (the loader provides exactly K snapshots; "
+                    f"shorter scales slice suffixes)"
+                )
+                assert getattr(config, "mem_source", "moment") == "moment", (
+                    "memory_scales requires mem_source='moment' — framesamp bypasses the moment "
+                    "memory (and its cross_attn fs-fallback path does not grow masks for M != n_q)"
+                )
+                from gr00t.model.modules.multiscale_memory import MultiScaleMemory
+                self.memory_transformer = MultiScaleMemory(
+                    dim=config.backbone_embedding_dim,
+                    n_q=self._mem_tokens_per_step,
+                    scales=self.memory_scales,
+                    num_layers=config.memory_num_layers,
+                    arch=mem_arch,
+                    hidden=getattr(config, "memory_hidden", 512),
+                    n_state=getattr(config, "memory_state_dim", 64),
+                    uniform_slots=getattr(config, "memory_scales_uniform", False),
+                    dog_tokens=getattr(config, "memory_scales_dog", False),
+                    comm=getattr(config, "memory_comm", False),
+                    aux_lambda=getattr(config, "memory_aux_lambda", 0.0),
+                    aux_horizons=parse_int_list(getattr(config, "memory_aux_horizons", "")),
+                    aux_warmup=getattr(config, "memory_aux_warmup_steps", 2000),
+                    aux_ema=getattr(config, "memory_aux_ema", 0.996),
+                    aux_detach_moment=getattr(config, "memory_aux_detach_moment", False),
+                )
+            elif mem_arch == "transformer":
+                self.memory_transformer = MemoryTransformer(
+                    dim=config.backbone_embedding_dim,
+                    n_q=self._mem_tokens_per_step,
+                    T=config.memory_window,
+                    num_layers=config.memory_num_layers,
+                )
+            else:
+                # recurrent / state-space memory (GRU / S4D / Mamba) — drop-in, same I/O contract.
+                from gr00t.model.modules.seq_memory import SequenceMemory
+                self.memory_transformer = SequenceMemory(
+                    dim=config.backbone_embedding_dim,
+                    n_q=self._mem_tokens_per_step,
+                    T=config.memory_window,
+                    num_layers=config.memory_num_layers,
+                    kind=mem_arch,
+                    hidden=getattr(config, "memory_hidden", 512),
+                    n_state=getattr(config, "memory_state_dim", 64),
+                )
         else:
             self.memory_transformer = None
 
         # Inference-time rolling cache. Shape: (B, K*n_q, d), oldest first to current last.
         self._memory_cache: torch.Tensor | None = None
         self._vision_cache: torch.Tensor | None = None
+        # mem_cond_type='dual' inference: a SEPARATE rolling raw-vision FIFO for the h_spatial
+        # (framesamp) channel, kept distinct from `_vision_cache`/`_memory_cache` so the moment
+        # (h_sem) memory state is never clobbered. Shape: (B, F*n_img, d), oldest first.
+        self._spatial_cache: torch.Tensor | None = None
+        # mem_window_mode: "recent" (recent-stride K FIFO) or "linspace" (CAUSAL episode-spanning:
+        # buffer ALL past moment read-outs and subsample linspace(0, now, K) each step, matching
+        # the loader's training-time window). _moment_buffer holds the full (B, t*n_q, d) history.
+        self.mem_window_mode = getattr(config, "mem_window_mode", "recent")
+        self._moment_buffer: torch.Tensor | None = None
 
         # memory-to-action conditioning. "cross_attn" (default) replaces the moment-token
         # tail of the action-head KV; "adaln" mean-pools the memory output through a
         # zero-init projection added to the DiT timestep embedding.
         self.mem_cond_type = getattr(config, "mem_cond_type", "cross_attn")
+
+        # v2b (Markdown/16_memory_into_image_tokens.md): inject per-frame memory state into the
+        # framesamp h_spatial tokens, so episode-spanning frames stop being ALIASED (identical
+        # swings get distinct, event-indexed tokens — the diagnosed v1-dual failure).
+        #   'none'   (default): byte-identical to v1 dual.
+        #   'te'     : sinusoidal frame-index embedding — ordering-only ablation.
+        #   'moment' : each F frame's OWN raw moment tail, contextualized IN EPISODE ORDER by a
+        #              dedicated block-causal MemoryTransformer (frame f's state = its place in
+        #              the event history; block-causal => only past frames visible).
+        # Both variants pass through a ZERO-INIT projection: step-0 forward is byte-identical
+        # to 'none' (the RT-1 zero-init recipe; NOT multiplicative FiLM — the modul -5.0 lesson).
+        self.mem_fs_inject = getattr(config, "mem_fs_inject", "none")
+        self.fs_inject_tf = None
+        self.fs_inject_proj = None
+        self._spatial_tail_cache: torch.Tensor | None = None
+        if self.mem_cond_type == "dual" and self.mem_fs_inject != "none":
+            assert self.mem_fs_inject in ("te", "moment"), (
+                f"mem_fs_inject={self.mem_fs_inject!r} (expected 'none'|'te'|'moment')"
+            )
+            assert self.mem_framesamp_frames > 0, (
+                "mem_fs_inject requires mem_framesamp_frames>0 (the F episode-spanning frames)"
+            )
+            _d_bb = config.backbone_embedding_dim
+            if self.mem_fs_inject == "moment":
+                self.fs_inject_tf = MemoryTransformer(
+                    dim=_d_bb,
+                    n_q=self._mem_tokens_per_step,
+                    T=self.mem_framesamp_frames,
+                    num_layers=2,
+                )
+            self.fs_inject_proj = nn.Linear(_d_bb, _d_bb)
+            nn.init.zeros_(self.fs_inject_proj.weight)
+            nn.init.zeros_(self.fs_inject_proj.bias)
         if (
             self.use_hamlet
             and self.memory_transformer is not None
@@ -204,6 +355,208 @@ class Gr00tN1d6ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def _fs_inject_states(self, tails_BFnd: torch.Tensor) -> torch.Tensor:
+        """v2b (note 16): per-frame injection state for the framesamp h_spatial tokens.
+
+        tails_BFnd: (B, F, n_q, d) — each episode-spanning frame's OWN raw moment tail,
+        oldest first (episode order).
+
+        'moment': contextualize the tails in order with the dedicated block-causal
+        transformer, so frame f's state encodes its position in the EVENT history
+        (identical frames -> distinct states: the anti-aliasing ingredient).
+        'te': sinusoidal frame-index embedding — the ordering-only ablation (same
+        zero-init projection path; if 'te' matches 'moment', the win was mere ordering).
+
+        Returns (B, F, d) AFTER the zero-init projection (=> exactly 0 at step 0).
+        """
+        B, Fn, n_q, d = tails_BFnd.shape
+        if self.mem_fs_inject == "moment":
+            ctx = self.fs_inject_tf(tails_BFnd.reshape(B, Fn * n_q, d))
+            s = ctx.view(B, Fn, n_q, d).mean(dim=2)
+        else:  # 'te'
+            half = d // 2
+            idx = torch.arange(Fn, device=tails_BFnd.device, dtype=torch.float32)
+            freqs = 10000.0 ** (
+                -torch.arange(half, device=tails_BFnd.device, dtype=torch.float32)
+                / max(half - 1, 1)
+            )
+            ang = idx[:, None] * freqs[None, :]  # (F, half)
+            te = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+            if te.shape[-1] < d:
+                te = F.pad(te, (0, d - te.shape[-1]))
+            s = te.to(tails_BFnd.dtype).unsqueeze(0).expand(B, Fn, d)
+        return self.fs_inject_proj(s)
+
+    def _framesamp_mem_seq(
+        self,
+        backbone_features_BKTd: torch.Tensor,  # (B, F, T, d)
+        image_mask_BKT: torch.Tensor | None,  # (B, F, T) bool, or None
+    ) -> torch.Tensor:
+        """mem_source='framesamp' (MME-VLA style): gather the RAW per-frame vision patch
+        tokens across the F supplied frames and even-`linspace` sub-sample to
+        `mem_framesamp_budget` tokens -> (B, budget_eff, d). Used as `mem_seq` for the
+        per-block MemoryFiLM instead of the compressed `mq_memory_out` moment tokens.
+
+        At training the F frames are the EPISODE-SPANNING linspace frames the loader appends
+        after the K-step memory window (`mem_framesamp_frames`); the inference path builds the
+        same representation from the rolling raw-vision FIFO cache. The model-side budget knob
+        is honored across whatever frames are passed in.
+        """
+        B, K, T, d = backbone_features_BKTd.shape
+        flat = backbone_features_BKTd.reshape(B, K * T, d)  # oldest frame first
+        if image_mask_BKT is not None:
+            # Per-sample image-token counts can differ; gather a uniform count = the min over
+            # the batch so the result is a dense (B, n, d) tensor (mask-free, like moment seq).
+            mask_flat = image_mask_BKT.reshape(B, K * T).bool()
+            counts = mask_flat.sum(dim=1)
+            n_img = int(counts.min().item())
+            if n_img == 0:
+                # No image tokens detected -> nothing raw to sample; caller falls back.
+                return None
+            rows = []
+            for b in range(B):
+                idx = mask_flat[b].nonzero(as_tuple=False).squeeze(1)[:n_img]
+                rows.append(flat[b, idx, :])
+            vis = torch.stack(rows, dim=0)  # (B, n_img, d), temporal order preserved
+        else:
+            vis = flat  # (B, K*T, d)
+        n_tok = vis.shape[1]
+        budget = min(self.mem_framesamp_budget, n_tok)
+        if budget < n_tok:
+            # Even temporal sub-sample over the whole window (MME-VLA linspace).
+            sel = torch.linspace(0, n_tok - 1, steps=budget, device=vis.device).round().long()
+            sel = torch.unique(sel)
+            vis = vis[:, sel, :]
+        return vis.contiguous()
+
+    def _patch_union_mem_seq(
+        self,
+        fs_backbone_BFTd: torch.Tensor,  # (B, F, T, d) candidate frames
+        fs_image_mask_BFT: torch.Tensor | None,  # (B, F, T) bool
+        moment_q_Bd: torch.Tensor,  # (B, d) relevance query (current moment tokens, mean)
+    ) -> torch.Tensor | None:
+        """mem_fs_select='patch_union' TRAINING path: pick `mem_framesamp_budget` individual
+        PATCH tokens out of the F candidate frames by the union of two channels
+        (Markdown/patch_memory_labels: union > either channel alone > z-sum):
+
+          novelty  (diff_share of the budget): token-space |delta| vs the SAME patch index in
+                   the previous candidate frame; frame 0 protected (TokenDrop sentinel).
+          relevance(rest): dot product with the current step's moment tokens — the model's own
+                   action-conditioning summary as the query (prefix-routed relevance;
+                   obj2all >> obj2act in the grounding probe). Same quantity is computable at
+                   inference from the current frame alone, so train/deploy match.
+
+        Selection is score-only (no_grad); the returned tokens keep their graph so gradients
+        flow to the selected patches exactly as in the linspace path.
+        """
+        B, Fn, T, d = fs_backbone_BFTd.shape
+        if fs_image_mask_BFT is not None:
+            m = fs_image_mask_BFT.bool()
+            n_img = int(m.sum(dim=2).min().item())
+            if n_img == 0:
+                return None
+            rows = []
+            for b in range(B):
+                fr = [fs_backbone_BFTd[b, f][m[b, f]][:n_img, :] for f in range(Fn)]
+                rows.append(torch.stack(fr, dim=0))
+            vis = torch.stack(rows, dim=0)  # (B, F, n_img, d)
+        else:
+            vis = fs_backbone_BFTd
+            n_img = T
+        flat_all = vis.reshape(B, Fn * n_img, d)
+        self._pu_n_cand = Fn * n_img
+        if self._pu_score_pass:
+            return flat_all.contiguous()  # pass A: score every candidate
+        budget = min(self.mem_framesamp_budget, Fn * n_img)
+        n_diff = max(1, int(round(budget * self.mem_fs_diff_share)))
+        n_attn = max(0, budget - n_diff)
+        with torch.no_grad():
+            v32 = vis.detach().float()
+            prev = torch.cat([v32[:, :1], v32[:, :-1]], dim=1)
+            diff = (v32 - prev).abs().mean(-1)  # (B, F, n_img)
+            diff[:, 0, :] = float("inf")  # frame-0 sentinel (TokenDrop)
+            if self._pu_rel is not None and self._pu_rel.shape[-1] == Fn * n_img:
+                rel = self._pu_rel.to(v32.device).float().view(B, Fn, n_img)
+            else:  # fallback (no captured attention): moment-token query
+                rel = torch.einsum("bfnd,bd->bfn", v32, moment_q_Bd.detach().float())
+            flat_d = diff.reshape(B, Fn * n_img)
+            flat_r = rel.reshape(B, Fn * n_img)
+            keep = []
+            for b in range(B):
+                idx_d = torch.topk(flat_d[b], min(n_diff, flat_d.shape[1])).indices
+                idx_r = torch.topk(flat_r[b], min(n_attn, flat_r.shape[1])).indices if n_attn else idx_d[:0]
+                u = torch.unique(torch.cat([idx_d, idx_r]))
+                u = u.sort().values[:budget]
+                if u.numel() < budget:  # pad by repeating the last (kept in temporal order)
+                    u = torch.cat([u, u[-1:].expand(budget - u.numel())])
+                keep.append(u)
+            keep_idx = torch.stack(keep, dim=0)  # (B, budget) into F*n_img, temporal order
+        return torch.gather(flat_all, 1, keep_idx.unsqueeze(-1).expand(B, budget, d)).contiguous()
+
+
+    @torch.no_grad()
+    def _patch_union_score_pass(self, backbone_output, action_input):
+        """Pass A: assemble the KV with ALL candidate patch tokens, run ONE DiT forward at a
+        fixed timestep, and return the captured action->candidate cross-attention (B, n_cand).
+
+        Cheap: the backbone is NOT re-run (its output is the input here); only the memory
+        assembly + one DiT forward over 16 action queries. Returns None on any failure, in
+        which case pass B falls back to the moment-token query."""
+        from transformers.feature_extraction_utils import BatchFeature as _BF
+
+        from gr00t.model.modules.fs_patch_union import capture_begin, capture_end
+
+        try:
+            bo = _BF(data=dict(backbone_output))
+            self._pu_score_pass, self._pu_rel = True, None
+            B = action_input.state.shape[0]
+            bo = self.process_backbone_output(bo, action_inputs_B=B)
+            cand = bo.get("mem_seq", None)
+            kv = bo["backbone_features"]
+            n_cand = cand.shape[1] if cand is not None else int(getattr(self, "_pu_n_cand", 0))
+            if n_cand == 0:
+                return None
+            device, dtype = kv.device, kv.dtype
+            state_features = self.state_encoder(action_input.state, action_input.embodiment_id)
+            horizon = self.config.action_horizon
+            noisy = torch.zeros(B, horizon, self.action_dim, device=device, dtype=dtype)
+            t_disc = torch.full((B,), self.num_timestep_buckets // 2, device=device, dtype=torch.long)
+            af = self.action_encoder(noisy, t_disc, action_input.embodiment_id)
+            if self.config.add_pos_embed:
+                pos = torch.arange(af.shape[1], dtype=torch.long, device=device)
+                af = af + self.position_embedding(pos).unsqueeze(0)
+            sa = torch.cat((state_features, af), dim=1)
+            n_cross = int(self.config.diffusion_model_cfg["num_layers"]) // 2
+            capture_begin(self.mem_fs_attn_layer, n_cross)
+            kwargs = dict(
+                hidden_states=sa, encoder_hidden_states=kv,
+                encoder_attention_mask=bo.get("backbone_attention_mask", None),
+                timestep=t_disc, return_all_hidden_states=True,
+                temb_add=bo.get("mem_temb_add", None),
+                mem_seq=bo.get("mem_seq", None),
+                mem_seq_spatial=bo.get("mem_seq_spatial", None),
+            )
+            if self.config.use_alternate_vl_dit:
+                kwargs["image_mask"] = bo.get("image_mask", None)
+                kwargs["backbone_attention_mask"] = bo.get("backbone_attention_mask", None)
+            self.model(**kwargs)
+            scores = capture_end()
+            if scores is None or scores.shape[0] != B:
+                return None
+            return scores[:, -n_cand:].detach()  # candidates occupy the KV tail
+        except Exception as e:
+            try:
+                capture_end()
+            except Exception:
+                pass
+            if not getattr(self, "_pu_warned", False):
+                print(f"[patch_union] score pass failed ({type(e).__name__}: {e}); "
+                      f"falling back to moment-token query", flush=True)
+                self._pu_warned = True
+            return None
+        finally:
+            self._pu_score_pass = False
+
     def process_backbone_output(
         self,
         backbone_output: BatchFeature,
@@ -239,9 +592,17 @@ class Gr00tN1d6ActionHead(nn.Module):
                     f"memory augmentation."
                 )
             if K == K_target:
-                mem_seq = primary.view(B, K, v_nq, d).view(B, K * v_nq, d)
-                mem_out = self.memory_transformer(mem_seq)
-                mem_aug = mem_out[:, -v_nq:, :]
+                if self.memory_scales:
+                    # multi-scale: the appended memory block is the L-scale token bank (B, M, d).
+                    mem_aug, _mem_aux_vf = self.memory_transformer.forward_multi(
+                        primary.view(B, K, v_nq, d)
+                    )
+                    if _mem_aux_vf is not None:
+                        backbone_output["mem_aux_loss"] = _mem_aux_vf
+                else:
+                    mem_seq = primary.view(B, K, v_nq, d).view(B, K * v_nq, d)
+                    mem_out = self.memory_transformer(mem_seq)
+                    mem_aug = mem_out[:, -v_nq:, :]
                 current = backbone_features.view(B, K, Tlen, d)[:, -1, :, :]  # unchanged
                 am = (
                     backbone_output["backbone_attention_mask"].view(B, K, -1)[:, -1, :]
@@ -256,11 +617,12 @@ class Gr00tN1d6ActionHead(nn.Module):
                 if self.mem_cond_type == "adaln":
                     backbone_output["mem_temb_add"] = self.mem_adaln_pool(mem_aug)
                 else:
+                    _Mv = mem_aug.shape[1]  # v_nq single-scale; L*v_nq(+extras) multi-scale
                     current = torch.cat([current, mem_aug], dim=1)
                     if am is not None:
-                        am = torch.cat([am, am.new_ones(B, v_nq)], dim=1)
+                        am = torch.cat([am, am.new_ones(B, _Mv)], dim=1)
                     if im is not None:
-                        im = torch.cat([im, im.new_zeros(B, v_nq)], dim=1)
+                        im = torch.cat([im, im.new_zeros(B, _Mv)], dim=1)
                 backbone_features = current
                 if am is not None:
                     backbone_output["backbone_attention_mask"] = am
@@ -279,21 +641,27 @@ class Gr00tN1d6ActionHead(nn.Module):
                     self._vision_cache = torch.cat(
                         [self._vision_cache[:, v_nq:, :], vis_current], dim=1
                     )
-                mem_out = self.memory_transformer(self._vision_cache)
-                mem_aug = mem_out[:, -v_nq:, :]
+                if self.memory_scales:
+                    mem_aug, _ = self.memory_transformer.forward_multi(
+                        self._vision_cache.view(B, K_target, v_nq, d)
+                    )
+                else:
+                    mem_out = self.memory_transformer(self._vision_cache)
+                    mem_aug = mem_out[:, -v_nq:, :]
                 if self.mem_cond_type == "adaln":
                     backbone_output["mem_temb_add"] = self.mem_adaln_pool(mem_aug)
                 else:
+                    _Mv = mem_aug.shape[1]
                     backbone_features = torch.cat([backbone_features, mem_aug], dim=1)
                     if "backbone_attention_mask" in backbone_output:
                         am = backbone_output["backbone_attention_mask"]
                         backbone_output["backbone_attention_mask"] = torch.cat(
-                            [am, am.new_ones(B, v_nq)], dim=1
+                            [am, am.new_ones(B, _Mv)], dim=1
                         )
                     if "image_mask" in backbone_output:
                         im = backbone_output["image_mask"]
                         backbone_output["image_mask"] = torch.cat(
-                            [im, im.new_zeros(B, v_nq)], dim=1
+                            [im, im.new_zeros(B, _Mv)], dim=1
                         )
             # else: unexpected K — pass through.
         elif (
@@ -309,20 +677,77 @@ class Gr00tN1d6ActionHead(nn.Module):
             assert BK == B * K, f"expected B*K rows, got {BK} for B={B}"
             K_target = self.memory_transformer.T
 
+            # mem_source='framesamp': the loader appends `mem_framesamp_frames` episode-spanning
+            # frames AFTER the K-step memory-window frames, so the backbone gives K_target + F
+            # rows per sample. Split them: the FIRST K_target rows are the K-window (moment
+            # memory), the LAST F rows are the framesamp episode-spanning frames. F==0 (every
+            # non-framesamp config) leaves the row layout exactly as before.
+            # Both 'modul' (FiLM path) and 'cross_attn' (KV path) consume these episode frames
+            # when mem_source=='framesamp' (experiment (d): route raw framesamp tokens through
+            # the winning cross_attn KV instead of the moment-token compression).
+            F = (
+                self.mem_framesamp_frames
+                if (
+                    (
+                        self.mem_cond_type in ("modul", "cross_attn")
+                        and self.mem_source == "framesamp"
+                    )
+                    # mem_cond_type='dual': the h_spatial (AC) channel also consumes the F
+                    # episode-spanning framesamp frames (when the loader supplied them).
+                    or self.mem_cond_type == "dual"
+                )
+                else 0
+            )
+            fs_backbone = None  # (B, F, T, d) raw episode-spanning frames, if framesamp
+            fs_image_mask = None  # (B, F, T) bool
+            if F > 0 and K == K_target + F:
+                feats_all = backbone_features.view(B, K, T, d)
+                fs_backbone = feats_all[:, K_target:, :, :].contiguous()  # episode-spanning frames
+                if "image_mask" in backbone_output:
+                    fs_image_mask = backbone_output["image_mask"].view(B, K, -1)[
+                        :, K_target:, :
+                    ].contiguous()
+                # Drop the framesamp frames from the K-window views so the rest of the path
+                # operates exactly as the non-framesamp K-step training path.
+                backbone_features = feats_all[:, :K_target, :, :].reshape(B * K_target, T, d)
+                if "backbone_attention_mask" in backbone_output:
+                    backbone_output["backbone_attention_mask"] = (
+                        backbone_output["backbone_attention_mask"]
+                        .view(B, K, -1)[:, :K_target, :]
+                        .reshape(B * K_target, -1)
+                    )
+                if "image_mask" in backbone_output:
+                    backbone_output["image_mask"] = (
+                        backbone_output["image_mask"]
+                        .view(B, K, -1)[:, :K_target, :]
+                        .reshape(B * K_target, -1)
+                    )
+                K = K_target
+                BK = B * K
+
             if K not in (1, K_target):
                 raise RuntimeError(
                     f"HAMLET memory: got K={K} backbone rows per action sample "
                     f"(expected 1 for rolling inference or memory_window={K_target} "
-                    f"for K-step training). The video delta_indices / memory_window "
-                    f"data config is inconsistent - refusing to silently skip "
-                    f"memory augmentation."
+                    f"for K-step training{', +%d framesamp frames' % F if F else ''}). The "
+                    f"video delta_indices / memory_window data config is inconsistent - "
+                    f"refusing to silently skip memory augmentation."
                 )
             if K == K_target:
                 # K-step training path: backbone gave K real timesteps per sample.
                 moment_all = backbone_features[:, -n_q:, :].contiguous().view(B, K, n_q, d)
-                mq_mem_seq = moment_all.view(B, K * n_q, d)  # oldest first -> current last
-                mq_memory_out = self.memory_transformer(mq_mem_seq)
-                mq_augmented = mq_memory_out[:, -n_q:, :]
+                if self.memory_scales:
+                    # MULTI-SCALE: per-scale read-outs over suffix windows, concatenated
+                    # (B, M, d) with M = L*n_q (+ uniform/DoG extras). The V2 BYOL aux loss
+                    # (training only) rides backbone_output to forward()'s loss.
+                    mq_augmented, _mem_aux = self.memory_transformer.forward_multi(moment_all)
+                    mq_memory_out = mq_augmented  # mem_seq (modul) = the multi-scale token bank
+                    if _mem_aux is not None:
+                        backbone_output["mem_aux_loss"] = _mem_aux
+                else:
+                    mq_mem_seq = moment_all.view(B, K * n_q, d)  # oldest first -> current last
+                    mq_memory_out = self.memory_transformer(mq_mem_seq)
+                    mq_augmented = mq_memory_out[:, -n_q:, :]
                 current = backbone_features.view(B, K, T, d)[:, -1, :, :]
                 am = (
                     backbone_output["backbone_attention_mask"].view(B, K, -1)[:, -1, :]
@@ -334,17 +759,152 @@ class Gr00tN1d6ActionHead(nn.Module):
                     if "image_mask" in backbone_output
                     else None
                 )
-                if self.mem_cond_type == "adaln":
-                    # AdaLN-zero: pool memory -> temb add; slice moment-token tail off the KV.
-                    backbone_output["mem_temb_add"] = self.mem_adaln_pool(mq_augmented)
+                if self.mem_cond_type == "dual":
+                    # HYBRID memory (h_sem + h_spatial), each through its OWN cross-attention:
+                    #   h_sem (DC): the moment tokens ride the action-head KV tail EXACTLY like the
+                    #               cross_attn moment path (the 18.4 baseline) — UNCHANGED.
+                    #   h_spatial (AC): raw per-position framesamp tokens on a SEPARATE key
+                    #               `mem_seq_spatial`, consumed by the per-block spatial_cross_attn
+                    #               (residual-add, zero-init -> 0 at init). The KV / am / im lengths
+                    #               stay exactly the moment path's (do NOT slice the n_q tail; do
+                    #               NOT append framesamp to the KV).
+                    current = torch.cat([current[:, :-n_q, :], mq_augmented], dim=1)
+                    _Mm = mq_augmented.shape[1]
+                    if _Mm != n_q:
+                        # multi-scale: KV tail grew n_q -> M; masks must grow to match (same
+                        # pattern as the framesamp M!=n_q path below).
+                        if am is not None:
+                            am = torch.cat([am[:, :-n_q], am.new_ones(B, _Mm)], dim=1)
+                        if im is not None:
+                            _tag = im.new_ones(B, _Mm) if self.mem_image_side else im.new_zeros(B, _Mm)
+                            im = torch.cat([im[:, :-n_q], _tag], dim=1)
+                    elif self.mem_image_side and im is not None:
+                        # Route the n_q moment tail through the IMAGE cross-attn pathway (clone
+                        # first: `im` is a (B, T) view sharing storage with the backbone image_mask).
+                        im = im.clone()
+                        im[:, -n_q:] = True
+                    # h_spatial: raw per-position framesamp tokens. With episode-spanning frames
+                    # available (F>0) they span the WHOLE episode; otherwise fall back to the
+                    # K-window frames. _framesamp_mem_seq may return None if there are no image
+                    # tokens — the DiT call site treats a missing key as "no spatial branch".
+                    if fs_backbone is not None:
+                        if self.mem_fs_inject != "none" and self.fs_inject_proj is not None:
+                            # v2b: color each episode frame's tokens with its per-frame state
+                            # (broadcast over the row; only image-masked tokens survive the
+                            # gather in _framesamp_mem_seq). The F rows carry their OWN raw
+                            # n_q moment tails at the row end — previously discarded.
+                            fs_tails = fs_backbone[:, :, -n_q:, :]  # (B, F, n_q, d)
+                            s_fs = self._fs_inject_states(fs_tails)  # (B, F, d), 0 at step-0
+                            fs_backbone = fs_backbone + s_fs[:, :, None, :]
+                        fs = self._framesamp_mem_seq(fs_backbone, fs_image_mask)
+                    else:
+                        im_full = (
+                            backbone_output["image_mask"].view(B, K, -1)
+                            if "image_mask" in backbone_output
+                            else None
+                        )
+                        fs = self._framesamp_mem_seq(
+                            backbone_features.view(B, K, T, d), im_full
+                        )
+                    if fs is not None:
+                        backbone_output["mem_seq_spatial"] = fs
+                elif self.mem_cond_type in ("adaln", "modul"):
+                    # Memory does NOT ride the KV: slice the moment-token tail off.
+                    #   adaln -> pooled memory added to temb;
+                    #   modul -> action head cross-attends the full memory seq + per-layer FiLM.
+                    if self.mem_cond_type == "adaln":
+                        backbone_output["mem_temb_add"] = self.mem_adaln_pool(mq_augmented)
+                    elif self.mem_source == "framesamp":
+                        # mem_source='framesamp': cross-attend RAW per-frame vision tokens
+                        # (linspace sub-sampled) instead of moment tokens. With episode-spanning
+                        # frames available (F>0) they span the WHOLE episode; otherwise fall back
+                        # to the K-window frames (and finally moment tokens if no image tokens).
+                        if fs_backbone is not None:
+                            fs = (
+                                self._patch_union_mem_seq(
+                                    fs_backbone, fs_image_mask,
+                                    backbone_features.view(B, K, T, d)[:, -1, -n_q:, :].mean(1),
+                                )
+                                if self.mem_fs_select == "patch_union"
+                                else self._framesamp_mem_seq(fs_backbone, fs_image_mask)
+                            )
+                        else:
+                            im_full = (
+                                backbone_output["image_mask"].view(B, K, -1)
+                                if "image_mask" in backbone_output
+                                else None
+                            )
+                            fs = self._framesamp_mem_seq(
+                                backbone_features.view(B, K, T, d), im_full
+                            )
+                        backbone_output["mem_seq"] = fs if fs is not None else mq_memory_out
+                    else:
+                        backbone_output["mem_seq"] = mq_memory_out
                     current = current[:, :-n_q, :]
                     if am is not None:
                         am = am[:, :-n_q]
                     if im is not None:
                         im = im[:, :-n_q]
+                elif self.mem_source == "framesamp":
+                    # cross_attn + framesamp (experiment (d)): the RAW per-frame vision tokens
+                    # (linspace sub-sampled to <=budget) replace the n_q moment-token tail in the
+                    # action-head KV, so the DiT cross-attends [image | text | framesamp(<=budget)]
+                    # through the existing cross_attn routing — NO moment-token compression.
+                    if fs_backbone is not None:
+                        fs = (
+                            self._patch_union_mem_seq(
+                                fs_backbone, fs_image_mask,
+                                backbone_features.view(B, K, T, d)[:, -1, -n_q:, :].mean(1),
+                            )
+                            if self.mem_fs_select == "patch_union"
+                            else self._framesamp_mem_seq(fs_backbone, fs_image_mask)
+                        )
+                    else:
+                        im_full = (
+                            backbone_output["image_mask"].view(B, K, -1)
+                            if "image_mask" in backbone_output
+                            else None
+                        )
+                        fs = self._framesamp_mem_seq(
+                            backbone_features.view(B, K, T, d), im_full
+                        )
+                    if fs is None:
+                        # No raw image tokens available -> fall back to the moment-augmented tail
+                        # so the KV length is unchanged (degenerate config).
+                        current = torch.cat([current[:, :-n_q, :], mq_augmented], dim=1)
+                    else:
+                        M = fs.shape[1]
+                        # Drop the n_q moment tail, append the M framesamp tokens. The KV length
+                        # CHANGES (n_q -> M). am/im must grow to match so the AlternateVLDiT
+                        # text/image split stays aligned (it indexes them by the KV length).
+                        current = torch.cat([current[:, :-n_q, :], fs], dim=1)
+                        if am is not None:
+                            am = torch.cat([am[:, :-n_q], am.new_ones(B, M)], dim=1)
+                        if im is not None:
+                            # Mark framesamp tokens as NON-image (image_mask=False) — same side as
+                            # the moment tail they replace — so they ride the alternating TEXT
+                            # cross-attn blocks (the mid-deep winning routing).
+                            # mem_image_side=True instead tags them image_mask=True so they ride
+                            # the IMAGE cross-attn pathway.
+                            mem_tag = im.new_ones(B, M) if self.mem_image_side else im.new_zeros(B, M)
+                            im = torch.cat([im[:, :-n_q], mem_tag], dim=1)
                 else:
                     # cross_attn: memory-augmented tokens replace the moment-token tail.
                     current = torch.cat([current[:, :-n_q, :], mq_augmented], dim=1)
+                    _Mm = mq_augmented.shape[1]
+                    if _Mm != n_q:
+                        # multi-scale: KV tail grew n_q -> M; masks must grow to match.
+                        if am is not None:
+                            am = torch.cat([am[:, :-n_q], am.new_ones(B, _Mm)], dim=1)
+                        if im is not None:
+                            _tag = im.new_ones(B, _Mm) if self.mem_image_side else im.new_zeros(B, _Mm)
+                            im = torch.cat([im[:, :-n_q], _tag], dim=1)
+                    elif self.mem_image_side and im is not None:
+                        # Route the n_q moment tail through the IMAGE cross-attn pathway.
+                        # Clone first: `im` is a (B, T) view sharing storage with the backbone
+                        # image_mask, and in-place writes would corrupt it.
+                        im = im.clone()
+                        im[:, -n_q:] = True
                 backbone_features = current
                 if am is not None:
                     backbone_output["backbone_attention_mask"] = am
@@ -352,9 +912,264 @@ class Gr00tN1d6ActionHead(nn.Module):
                     backbone_output["image_mask"] = im
             elif K == 1:
                 # Inference path with rolling FIFO cache.
+                # framesamp at K==1: maintain a rolling FIFO of RAW per-frame vision tokens
+                # (mirrors the vision_feature `_vision_cache`, but stores the raw image-token
+                # slice instead of the pooled-64 primary view) and build mem_seq from it with
+                # the SAME linspace->budget logic as training. The cache lives on
+                # `self._vision_cache` so the Gr00tPolicy per-session round-trip (which already
+                # checkpoints `_vision_cache`) isolates it per episode with no policy change.
+                use_framesamp_infer = (
+                    self.mem_cond_type in ("modul", "cross_attn")
+                    and self.mem_source == "framesamp"
+                    and F > 0
+                    and "image_mask" in backbone_output
+                )
+                # mem_cond_type='dual' h_spatial channel: maintain an INDEPENDENT rolling raw-vision
+                # FIFO on `self._spatial_cache` (NOT `_vision_cache`/`_memory_cache`, so the moment
+                # h_sem state below is never clobbered) and emit it as `mem_seq_spatial`. The moment
+                # h_sem path runs unchanged at the bottom of this K==1 block (dual is not in
+                # ('adaln','modul'), so it appends `mq_augmented` to the KV like cross_attn). This
+                # block only SETS mem_seq_spatial — it does NOT touch backbone_features/am/im and
+                # does NOT early-return.
+                if (
+                    self.mem_cond_type == "dual"
+                    and F > 0
+                    and "image_mask" in backbone_output
+                ):
+                    im_cur_sp = backbone_output["image_mask"].bool()  # (B, T)
+                    n_img_sp = int(im_cur_sp.sum(dim=1).min().item())
+                    if n_img_sp > 0:
+                        rows_sp = [
+                            backbone_features[b, im_cur_sp[b]][:n_img_sp, :] for b in range(B)
+                        ]
+                        vis_cur_sp = torch.stack(rows_sp, dim=0)  # (B, n_img, d), current frame
+                        Wcache_sp = F * n_img_sp  # rolling window = F most-recent frames
+                        if self._spatial_cache is None or self._spatial_cache.shape[0] != B:
+                            self._spatial_cache = vis_cur_sp.repeat(1, F, 1)
+                        elif reset_memory is not None and reset_memory.any():
+                            defaults_sp = vis_cur_sp.repeat(1, F, 1)
+                            shifted_sp = torch.cat(
+                                [self._spatial_cache[:, n_img_sp:, :], vis_cur_sp], dim=1
+                            )
+                            reset_b_sp = reset_memory.view(B, 1, 1).expand(B, Wcache_sp, d)
+                            self._spatial_cache = torch.where(reset_b_sp, defaults_sp, shifted_sp)
+                        else:
+                            self._spatial_cache = torch.cat(
+                                [self._spatial_cache[:, n_img_sp:, :], vis_cur_sp], dim=1
+                            )
+                        # v2b: mirror FIFO of the per-step RAW moment tails (episode order),
+                        # kept separate so the moment h_sem cache is never clobbered.
+                        if self.mem_fs_inject != "none" and self.fs_inject_proj is not None:
+                            tail_cur_sp = backbone_features[:, -n_q:, :]  # (B, n_q, d)
+                            _Wt = self.mem_framesamp_frames * n_q
+                            if (
+                                self._spatial_tail_cache is None
+                                or self._spatial_tail_cache.shape[0] != B
+                            ):
+                                self._spatial_tail_cache = tail_cur_sp.repeat(
+                                    1, self.mem_framesamp_frames, 1
+                                )
+                            elif reset_memory is not None and reset_memory.any():
+                                defaults_tl = tail_cur_sp.repeat(1, self.mem_framesamp_frames, 1)
+                                shifted_tl = torch.cat(
+                                    [self._spatial_tail_cache[:, n_q:, :], tail_cur_sp], dim=1
+                                )
+                                reset_tl = reset_memory.view(B, 1, 1).expand(B, _Wt, d)
+                                self._spatial_tail_cache = torch.where(
+                                    reset_tl, defaults_tl, shifted_tl
+                                )
+                            else:
+                                self._spatial_tail_cache = torch.cat(
+                                    [self._spatial_tail_cache[:, n_q:, :], tail_cur_sp], dim=1
+                                )
+                        # Same linspace->budget sub-sample as training (_framesamp_mem_seq).
+                        # v2b: inject per-frame states into the cached frame tokens at READ time
+                        # (never mutate the cache itself).
+                        if self.mem_fs_inject != "none" and self.fs_inject_proj is not None:
+                            _Fs = self.mem_framesamp_frames
+                            tails_sp = self._spatial_tail_cache.view(B, _Fs, n_q, d)
+                            s_sp = self._fs_inject_states(tails_sp)  # (B, F, d)
+                            vis_sp = (
+                                self._spatial_cache.view(B, _Fs, n_img_sp, d)
+                                + s_sp[:, :, None, :]
+                            ).reshape(B, _Fs * n_img_sp, d)
+                        else:
+                            vis_sp = self._spatial_cache
+                        n_tok_sp = vis_sp.shape[1]
+                        budget_sp = min(self.mem_framesamp_budget, n_tok_sp)
+                        if budget_sp < n_tok_sp:
+                            sel_sp = (
+                                torch.linspace(
+                                    0, n_tok_sp - 1, steps=budget_sp, device=vis_sp.device
+                                )
+                                .round()
+                                .long()
+                            )
+                            sel_sp = torch.unique(sel_sp)
+                            vis_sp = vis_sp[:, sel_sp, :]
+                        backbone_output["mem_seq_spatial"] = vis_sp.contiguous()
+                if use_framesamp_infer:
+                    # Current frame's raw image tokens (moment tokens are NOT image tokens, so
+                    # the image_mask already excludes them). Per-sample count is uniform (square
+                    # vision grid) -> take the per-batch min for a dense (B, n_img, d) tensor.
+                    im_cur = backbone_output["image_mask"].bool()  # (B, T)
+                    counts = im_cur.sum(dim=1)
+                    n_img = int(counts.min().item())
+                    if n_img > 0:
+                        rows = [backbone_features[b, im_cur[b]][:n_img, :] for b in range(B)]
+                        vis_current = torch.stack(rows, dim=0)  # (B, n_img, d), current frame
+                        Wcache = F * n_img  # rolling window = F most-recent frames
+                        if self._vision_cache is None or self._vision_cache.shape[0] != B:
+                            self._vision_cache = vis_current.repeat(1, F, 1)
+                        elif reset_memory is not None and reset_memory.any():
+                            defaults = vis_current.repeat(1, F, 1)
+                            shifted = torch.cat(
+                                [self._vision_cache[:, n_img:, :], vis_current], dim=1
+                            )
+                            reset_b = reset_memory.view(B, 1, 1).expand(B, Wcache, d)
+                            self._vision_cache = torch.where(reset_b, defaults, shifted)
+                        else:
+                            self._vision_cache = torch.cat(
+                                [self._vision_cache[:, n_img:, :], vis_current], dim=1
+                            )
+                        # Same linspace->budget sub-sample as training (_framesamp_mem_seq).
+                        # mem_fs_select='diff': override the READ with TokenDrop-style
+                        # pixel-diff keyframes (frame 0 + top-(F-2) diff peaks + current).
+                        # The FIFO update above still runs unconditionally — it remains the
+                        # per-session liveness/round-trip anchor in Gr00tPolicy, so the
+                        # default path stays byte-identical and reset semantics are shared.
+                        if self.mem_fs_select == "patch_union":
+                            # Patch-level union memory, INFERENCE. READ the heap now (memory at
+                            # step t = history < t); the current frame's patches are SCORED by
+                            # the same quantity training uses — the DiT's action->patch
+                            # cross-attention at mem_fs_attn_layer, captured during this very
+                            # forward — and committed AFTER the action (post-action write).
+                            from gr00t.model.modules.fs_patch_union import (
+                                PatchUnionSelector,
+                                capture_begin,
+                            )
+
+                            if self._fs_state is None or len(self._fs_state) != B:
+                                self._fs_state = [None] * B
+                            Lm_kv = backbone_features.shape[1] - n_q
+                            rows_sel, pending = [], []
+                            for b in range(B):
+                                sel_b = self._fs_state[b]
+                                if not isinstance(sel_b, PatchUnionSelector) or (
+                                    reset_memory is not None and bool(reset_memory[b])
+                                ):
+                                    sel_b = PatchUnionSelector(
+                                        budget=self.mem_framesamp_budget,
+                                        diff_share=self.mem_fs_diff_share,
+                                        stride=self.mem_fs_diff_stride,
+                                    )
+                                    self._fs_state[b] = sel_b
+                                v_b = vis_current[b].detach()
+                                idx_b = im_cur[b][:Lm_kv].nonzero(as_tuple=False).squeeze(1)[
+                                    : v_b.shape[0]
+                                ]
+                                rows_sel.append(sel_b.read(v_b))
+                                pending.append((sel_b, v_b, idx_b))
+                            self._pu_pending = pending
+                            n_cross = int(self.config.diffusion_model_cfg["num_layers"]) // 2
+                            capture_begin(self.mem_fs_attn_layer, n_cross)
+                            vis = torch.stack(rows_sel, dim=0)  # (B, budget, d)
+                        elif self.mem_fs_select == "diff":
+                            from gr00t.model.modules.fs_diff_select import (
+                                DiffFrameSelector,
+                                split_fs_pixels,
+                            )
+
+                            if self._fs_state is None or len(self._fs_state) != B:
+                                self._fs_state = [None] * B
+                            pix_rows = split_fs_pixels(backbone_output, B)
+                            rows_sel = []
+                            for b in range(B):
+                                sel_b = self._fs_state[b]
+                                if sel_b is None or (
+                                    reset_memory is not None and bool(reset_memory[b])
+                                ):
+                                    sel_b = DiffFrameSelector(
+                                        max_frames=F, stride=self.mem_fs_diff_stride
+                                    )
+                                    self._fs_state[b] = sel_b
+                                sel_b.observe(
+                                    vis_current[b],
+                                    pix_rows[b] if pix_rows is not None else None,
+                                )
+                                rows_sel.append(sel_b.read(vis_current[b]))
+                            vis = torch.stack(rows_sel, dim=0)  # (B, F*n_img, d)
+                        else:
+                            vis = self._vision_cache
+                        n_tok = vis.shape[1]
+                        budget = min(self.mem_framesamp_budget, n_tok)
+                        if budget < n_tok:
+                            sel = torch.linspace(
+                                0, n_tok - 1, steps=budget, device=vis.device
+                            ).round().long()
+                            sel = torch.unique(sel)
+                            vis = vis[:, sel, :]
+                        vis = vis.contiguous()
+                        if self.mem_cond_type == "cross_attn":
+                            # cross_attn + framesamp (experiment (d)): the framesamp tokens
+                            # REPLACE the moment-token tail in the KV (mirror of training). The
+                            # KV length changes (n_q -> M); grow am/im to match, marking the
+                            # framesamp tokens NON-image so they ride the TEXT cross-attn blocks.
+                            M = vis.shape[1]
+                            backbone_features = torch.cat(
+                                [backbone_features[:, :-n_q, :], vis], dim=1
+                            )
+                            if "backbone_attention_mask" in backbone_output:
+                                am0 = backbone_output["backbone_attention_mask"]
+                                backbone_output["backbone_attention_mask"] = torch.cat(
+                                    [am0[:, :-n_q], am0.new_ones(B, M)], dim=1
+                                )
+                            im0 = backbone_output["image_mask"]
+                            # mem_image_side=True tags the framesamp tokens image_mask=True so
+                            # they ride the IMAGE cross-attn pathway (default False = TEXT).
+                            mem_tag0 = im0.new_ones(B, M) if self.mem_image_side else im0.new_zeros(B, M)
+                            backbone_output["image_mask"] = torch.cat(
+                                [im0[:, :-n_q], mem_tag0], dim=1
+                            )
+                        else:
+                            backbone_output["mem_seq"] = vis
+                            # Slice the moment-token tail off the KV (modul does not ride the KV).
+                            backbone_features = backbone_features[:, :-n_q, :]
+                            if "backbone_attention_mask" in backbone_output:
+                                backbone_output["backbone_attention_mask"] = backbone_output[
+                                    "backbone_attention_mask"
+                                ][:, :-n_q]
+                            backbone_output["image_mask"] = backbone_output["image_mask"][:, :-n_q]
+                        backbone_output["backbone_features"] = backbone_features
+                        return backbone_output
+
                 moment_current = backbone_features[:, -n_q:, :]  # (B, n_q, d)
 
-                if self._memory_cache is None or self._memory_cache.shape[0] != B:
+                if self.mem_window_mode == "linspace":
+                    # CAUSAL episode-spanning window: keep a growing buffer of ALL past moment
+                    # read-outs, then subsample linspace(0, t-1, K_target) -> (B, K_target*n_q, d),
+                    # matching the loader's training-time linspace(0, anchor, K). Conservative reset:
+                    # any reset flag (or episode-boundary reset_memory()) restarts the buffer.
+                    if (
+                        self._moment_buffer is None
+                        or self._moment_buffer.shape[0] != B
+                        or (reset_memory is not None and reset_memory.any())
+                    ):
+                        self._moment_buffer = moment_current  # (B, n_q, d)
+                    else:
+                        self._moment_buffer = torch.cat([self._moment_buffer, moment_current], dim=1)
+                    t = self._moment_buffer.shape[1] // n_q
+                    sel = (
+                        torch.linspace(0, t - 1, steps=K_target, device=moment_current.device)
+                        .round()
+                        .long()
+                    )
+                    tok_idx = (
+                        sel.unsqueeze(1) * n_q
+                        + torch.arange(n_q, device=moment_current.device).unsqueeze(0)
+                    ).reshape(-1)
+                    self._memory_cache = self._moment_buffer[:, tok_idx, :]  # (B, K_target*n_q, d)
+                elif self._memory_cache is None or self._memory_cache.shape[0] != B:
                     # First call (or batch-size mismatch): K-replicate current moment-token to fill the window.
                     self._memory_cache = moment_current.repeat(1, K_target, 1)
                 else:
@@ -368,10 +1183,43 @@ class Gr00tN1d6ActionHead(nn.Module):
                             [self._memory_cache[:, n_q:, :], moment_current], dim=1
                         )
 
-                mq_memory_out = self.memory_transformer(self._memory_cache)
-                mq_augmented = mq_memory_out[:, -n_q:, :]
-                if self.mem_cond_type == "adaln":
-                    backbone_output["mem_temb_add"] = self.mem_adaln_pool(mq_augmented)
+                if self.memory_scales:
+                    # MULTI-SCALE inference: the K_target FIFO (or linspace buffer) already holds
+                    # max-scale snapshots; scales slice suffixes inside forward_multi. No aux at eval.
+                    mq_augmented, _ = self.memory_transformer.forward_multi(
+                        self._memory_cache.view(B, K_target, n_q, d)
+                    )
+                    mq_memory_out = mq_augmented
+                else:
+                    mq_memory_out = self.memory_transformer(self._memory_cache)
+                    mq_augmented = mq_memory_out[:, -n_q:, :]
+                if os.environ.get("DUAL_DEBUG"):
+                    _mc = self._memory_cache
+                    _nf = (_mc.shape[1] // n_q) if _mc is not None else 0
+                    _std = (_mc.float().view(_mc.shape[0], _nf, n_q, _mc.shape[-1]).std(dim=1).mean().item()
+                            if (_mc is not None and _nf > 1) else -1.0)
+                    _rm = reset_memory.tolist() if reset_memory is not None else None
+                    print(f"[DUAL_DBG] K==1 mc_frames={_nf} interframe_std={_std:.4f} "
+                          f"mq_aug_norm={float(mq_augmented.float().norm()):.3f} reset={_rm}", flush=True)
+                if self.mem_cond_type in ("adaln", "modul"):
+                    if self.mem_cond_type == "adaln":
+                        backbone_output["mem_temb_add"] = self.mem_adaln_pool(mq_augmented)
+                    else:
+                        # framesamp normally builds mem_seq from the rolling raw-vision FIFO
+                        # above (and early-returns). We only reach here in the degenerate case
+                        # mem_framesamp_frames==0 or no image tokens were present -> fall back to
+                        # moment tokens for mem_seq and warn once.
+                        if self.mem_source == "framesamp" and not getattr(
+                            self, "_warned_framesamp_infer", False
+                        ):
+                            print(
+                                "[HAMLET][WARN] mem_source='framesamp' could not build a raw-vision "
+                                "mem_seq at K==1 inference (mem_framesamp_frames==0 or no image "
+                                "tokens); using moment tokens. Set mem_framesamp_frames>0 for true "
+                                "framesamp inference."
+                            )
+                            self._warned_framesamp_infer = True
+                        backbone_output["mem_seq"] = mq_memory_out
                     backbone_features = backbone_features[:, :-n_q, :]
                     if "backbone_attention_mask" in backbone_output:
                         backbone_output["backbone_attention_mask"] = backbone_output[
@@ -383,10 +1231,44 @@ class Gr00tN1d6ActionHead(nn.Module):
                     backbone_features = torch.cat(
                         [backbone_features[:, :-n_q, :], mq_augmented], dim=1
                     )
+                    _Mm = mq_augmented.shape[1]
+                    if _Mm != n_q:
+                        # multi-scale: KV length changed (n_q -> M); grow masks to match
+                        # (mirror of the K==1 framesamp pattern above).
+                        if "backbone_attention_mask" in backbone_output:
+                            am0 = backbone_output["backbone_attention_mask"]
+                            backbone_output["backbone_attention_mask"] = torch.cat(
+                                [am0[:, :-n_q], am0.new_ones(B, _Mm)], dim=1
+                            )
+                        if "image_mask" in backbone_output:
+                            im0 = backbone_output["image_mask"]
+                            _tag = (
+                                im0.new_ones(B, _Mm) if self.mem_image_side else im0.new_zeros(B, _Mm)
+                            )
+                            backbone_output["image_mask"] = torch.cat([im0[:, :-n_q], _tag], dim=1)
+                    elif self.mem_image_side and "image_mask" in backbone_output:
+                        # Route the n_q moment tail through the IMAGE cross-attn pathway.
+                        # image_mask is unchanged length T in this branch; clone before the
+                        # in-place write so we never mutate shared backbone storage.
+                        im0 = backbone_output["image_mask"].clone()
+                        im0[:, -n_q:] = True
+                        backbone_output["image_mask"] = im0
             else:
                 # Unexpected K — pass through.
                 pass
 
+        if os.environ.get("DUAL_NO_SPATIAL"):
+            # DEBUG bisection: drop h_spatial so the DiT spatial branch is skipped
+            # (mem_seq_spatial=None) -> pure moment h_sem path. Isolates spatial-corrupts vs base.
+            backbone_output.pop("mem_seq_spatial", None)
+        if os.environ.get("DUAL_DEBUG"):
+            _am = backbone_output.get("backbone_attention_mask")
+            _im = backbone_output.get("image_mask")
+            print(f"[DUAL_KV] bf={tuple(backbone_features.shape)} norm={float(backbone_features.float().norm()):.1f} "
+                  f"am.sum={int(_am.sum()) if _am is not None else None} "
+                  f"im.sum={int(_im.sum()) if _im is not None else None} "
+                  f"has_memspat={'mem_seq_spatial' in backbone_output} "
+                  f"has_memseq={'mem_seq' in backbone_output}", flush=True)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
@@ -394,6 +1276,8 @@ class Gr00tN1d6ActionHead(nn.Module):
         """Clear the rolling memory cache. Call at episode boundary."""
         self._memory_cache = None
         self._vision_cache = None
+        self._spatial_cache = None
+        self._moment_buffer = None
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -419,6 +1303,10 @@ class Gr00tN1d6ActionHead(nn.Module):
         # K-step HAMLET: pass the action-input batch size so process_backbone_output can
         # collapse the B*K backbone rows back to B current-step rows after memory aggregation.
         B_target = action_input.state.shape[0]
+        if self.mem_fs_select == "patch_union" and self.mem_source == "framesamp":
+            # Pass A (no_grad): score every candidate patch by the DiT's own action->patch
+            # cross-attention, then pass B below selects the union top-budget with it.
+            self._pu_rel = self._patch_union_score_pass(backbone_output, action_input)
         backbone_output = self.process_backbone_output(backbone_output, action_inputs_B=B_target)
 
         # Get vision and language embeddings.
@@ -485,6 +1373,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
                 temb_add=mem_temb_add,
+                mem_seq=backbone_output.get("mem_seq", None),
+                mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
             )
         else:
             model_output, _ = self.model(
@@ -494,6 +1384,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                 timestep=t_discretized,
                 return_all_hidden_states=True,
                 temb_add=mem_temb_add,
+                mem_seq=backbone_output.get("mem_seq", None),
+                mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
             )
 
         pred = self.action_decoder(model_output, embodiment_id)
@@ -504,13 +1396,23 @@ class Gr00tN1d6ActionHead(nn.Module):
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
-        return {
+        # Multi-scale V2: per-scale BYOL predictive aux loss (lambda + warmup already applied
+        # inside MultiScaleMemory; present only in training K-step forwards).
+        mem_aux_loss = backbone_output.get("mem_aux_loss", None)
+        if mem_aux_loss is not None:
+            loss = loss + mem_aux_loss
+
+        out = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+        if mem_aux_loss is not None:
+            # only include when present — a None value breaks HF Trainer's eval nested_detach
+            out["mem_aux_loss"] = mem_aux_loss
+        return out
 
     def _encode_features(
         self,
@@ -522,6 +1424,8 @@ class Gr00tN1d6ActionHead(nn.Module):
         Encode features for the action head.
         """
         B_target = action_input.state.shape[0]
+        if self.mem_fs_select == "patch_union" and self.mem_source == "framesamp":
+            self._pu_rel = self._patch_union_score_pass(backbone_output, action_input)
         backbone_output = self.process_backbone_output(
             backbone_output, action_inputs_B=B_target, reset_memory=reset_memory
         )
@@ -606,6 +1510,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                     temb_add=mem_temb_add,
+                    mem_seq=backbone_output.get("mem_seq", None),
+                    mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
                 )
             else:
                 model_output = self.model(
@@ -613,6 +1519,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                     temb_add=mem_temb_add,
+                    mem_seq=backbone_output.get("mem_seq", None),
+                    mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
@@ -645,18 +1553,43 @@ class Gr00tN1d6ActionHead(nn.Module):
             # needed. Skip flow-matching denoising so the (seeded) action-noise RNG is
             # NOT advanced — keeps action noise call-aligned with non-primed policies
             # for strict paired comparison (and makes priming much cheaper).
+            if self.mem_fs_select == "patch_union":
+                from gr00t.model.modules.fs_patch_union import capture_end
+
+                capture_end()
+                self._pu_commit(None)  # no denoise ran -> novelty channel only
             ref = features.backbone_features
             zeros = torch.zeros(
                 ref.shape[0], self.config.action_horizon, self.action_dim,
                 device=ref.device, dtype=ref.dtype,
             )
             return BatchFeature(data={"action_pred": zeros})
-        return self.get_action_with_features(
+        out = self.get_action_with_features(
             backbone_features=features.backbone_features,
             state_features=features.state_features,
             embodiment_id=action_input.embodiment_id,
             backbone_output=backbone_output,
         )
+        if self.mem_fs_select == "patch_union":
+            from gr00t.model.modules.fs_patch_union import capture_end
+
+            self._pu_commit(capture_end())
+        return out
+
+    def _pu_commit(self, attn_scores):
+        """Post-action write (inference): score the current frame's patches with the captured
+        action->patch attention (same quantity as training pass A) and push them into the
+        per-session heaps. Novelty is token-space, as in training."""
+        pending, self._pu_pending = self._pu_pending, None
+        if not pending:
+            return
+        for b, (sel_b, v_b, idx_b) in enumerate(pending):
+            a = None
+            if attn_scores is not None and b < attn_scores.shape[0]:
+                row = attn_scores[b]
+                if idx_b is not None and idx_b.numel() > 0 and int(idx_b.max()) < row.shape[0]:
+                    a = row[idx_b.to(row.device)].float().cpu()
+            sel_b.observe(v_b, None, a)
 
     @property
     def device(self):
@@ -737,6 +1670,7 @@ class Gr00tN1d6(PreTrainedModel):
             self.action_head = Gr00tN1d6TCLHead(
                 backbone_embedding_dim=config.backbone_embedding_dim,
                 tcl_tau=config.tcl_tau,
+                no_projection_head=getattr(config, "tcl_no_projection_head", False),
             )
             # TCL stage: freeze everything except moment_tokens and moment_to_repr.
             for p in self.backbone.parameters():
@@ -836,6 +1770,13 @@ class Gr00tN1d6(PreTrainedModel):
 
         # Forward through backbone
         backbone_outputs = self.backbone(backbone_inputs)
+        if (
+            getattr(self.action_head, "mem_fs_select", "fifo") in ("diff", "patch_union")
+            and "pixel_values" in backbone_inputs
+        ):
+            # Raw pixels for the diff-keyframe write score (fs_diff_select). Score-only:
+            # never enters the computation graph or the memory tokens themselves.
+            backbone_outputs["fs_pixels"] = backbone_inputs["pixel_values"]
         action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
 
         return action_outputs

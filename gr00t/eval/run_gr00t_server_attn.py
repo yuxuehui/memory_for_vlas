@@ -49,16 +49,63 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
-    mem_fs_select: str | None = None
-    """Override inference framesamp frame selection on the loaded checkpoint:
-    'fifo' (recent-F window, default behavior) or 'diff' (TokenDrop-style
-    pixel-difference keyframes). None = use the checkpoint config."""
 
-    mem_fs_diff_stride: int | None = None
-    """Override the 'diff'/'patch_union' scoring cadence in policy calls (default 8)."""
+def _install_attn_capture(policy, attn_dir):
+    """ENV-GATED (ATTN_DUMP_DIR): dump per policy call the action->image attention heatmap per DiT
+    cross-attn layer for BOTH camera views (front=view0, wrist=view1) + both frames + img/lang split.
+    Closed-loop rollout introspection. (Separate server file so the normal eval server stays pristine.)"""
+    import sys
+    import numpy as np
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, os.path.join(repo, "scripts"))
+    import visualize_memory_attention as V  # noqa: E402
 
-    mem_fs_attn_layer: int | None = None
-    """patch_union: DiT cross-attn layer for the attention channel (default 13)."""
+    inner = getattr(policy, "policy", policy)
+    os.makedirs(attn_dir, exist_ok=True)
+    V.install_attn_hooks()
+    V.install_imagemask_hook(inner.model)
+    n_cross = int(inner.model.config.diffusion_model_cfg["num_layers"]) // 2
+    vkeys = inner.modality_configs["video"].modality_keys
+    st = {"n": 0}
+    orig = policy.get_action
+
+    def _frame(observation, key):
+        fv = np.asarray(observation.get(f"video.{key}", observation.get(key)))
+        while fv.ndim > 3:
+            fv = fv[0]
+        return fv.astype(np.uint8)
+
+    def wrapped(observation, *a, **kw):
+        V._CAP["cross"].clear(); V._CAP["image_mask"] = None
+        out = orig(observation, *a, **kw)
+        try:
+            front = _frame(observation, vkeys[0])
+            wrist = _frame(observation, vkeys[1]) if len(vkeys) > 1 else front
+            im = V._CAP["image_mask"]; raw = list(V._CAP["cross"])
+            if im is not None and raw:
+                mask = im[0].bool()
+                n_den = max(1, len(raw) // n_cross)
+                fronts, wrists, imgs, langs = [], [], [], []
+                for li in range(n_cross):
+                    As = [raw[d * n_cross + li] for d in range(n_den) if d * n_cross + li < len(raw)]
+                    av = sum(A[0].float().mean(0) for A in As) / len(As)
+                    if av.shape[0] != mask.shape[0]:
+                        continue
+                    fronts.append(V.img_heat_from_cross(av[mask], n_views=2, view=0))
+                    wrists.append(V.img_heat_from_cross(av[mask], n_views=2, view=1))
+                    imgs.append(float(av[mask].sum())); langs.append(float(av[~mask].sum()))
+                zz = lambda L: np.asarray([(h if h is not None else np.zeros((9, 9), np.float32)) for h in L], np.float32)
+                np.savez_compressed(os.path.join(attn_dir, f"call_{st['n']:04d}.npz"),
+                                    front=front, wrist=wrist,
+                                    front_heats=zz(fronts), wrist_heats=zz(wrists), heats=zz(fronts),
+                                    img=np.asarray(imgs, np.float32), lang=np.asarray(langs, np.float32))
+                st["n"] += 1
+        except Exception as e:
+            print(f"[attn-capture] err: {type(e).__name__}: {e}")
+        return out
+
+    policy.get_action = wrapped
+    print(f"[attn-capture] ENABLED(2-view) -> {attn_dir} (n_cross={n_cross}, vkeys={vkeys})")
 
 
 def main(config: ServerConfig):
@@ -81,18 +128,6 @@ def main(config: ServerConfig):
             device=config.device,
             strict=config.strict,
         )
-        # Eval-time framesamp keyframe-selection override (inference-only knob; safe on
-        # any checkpoint — the model reads it via getattr with a "fifo" default).
-        if config.mem_fs_select is not None:
-            assert config.mem_fs_select in ("fifo", "diff", "patch_union"), config.mem_fs_select
-            policy.model.action_head.mem_fs_select = config.mem_fs_select
-            print(f"  mem_fs_select override: {config.mem_fs_select}")
-        if config.mem_fs_diff_stride is not None:
-            policy.model.action_head.mem_fs_diff_stride = int(config.mem_fs_diff_stride)
-            print(f"  mem_fs_diff_stride override: {config.mem_fs_diff_stride}")
-        if config.mem_fs_attn_layer is not None:
-            policy.model.action_head.mem_fs_attn_layer = int(config.mem_fs_attn_layer)
-            print(f"  mem_fs_attn_layer override: {config.mem_fs_attn_layer}")
     elif config.dataset_path is not None:
         if config.modality_config_path is None:
             from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
@@ -115,6 +150,10 @@ def main(config: ServerConfig):
         from gr00t.policy.gr00t_policy import Gr00tSimPolicyWrapper
 
         policy = Gr00tSimPolicyWrapper(policy)
+
+    _attn_dir = os.environ.get("ATTN_DUMP_DIR")
+    if _attn_dir and config.use_sim_policy_wrapper:
+        _install_attn_capture(policy, _attn_dir)
 
     server = PolicyServer(
         policy=policy,

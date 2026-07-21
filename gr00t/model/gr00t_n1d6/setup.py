@@ -66,25 +66,45 @@ class Gr00tN1d6Pipeline(ModelPipeline):
         # Build transformers loading kwargs from training config
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
+            # HAMLET fix: some config overrides (notably the bool `mem_image_side`, and
+            # `mem_framesamp_frames` which was not forwarded at all) were silently dropped
+            # when passed as loose kwargs to AutoModel.from_pretrained — the loaded base
+            # checkpoint config does not carry these keys, so HF's kwarg routing left them
+            # at their dataclass defaults (mem_image_side=False), defeating exp-e (image
+            # pathway). Build the config explicitly from the checkpoint, apply ALL HAMLET
+            # overrides on it deterministically, and pass it via `config=` so the model
+            # __init__ (which reads getattr(config, ...)) sees the intended values.
+            from transformers import AutoConfig as _AutoConfig
+
+            _ckpt_cfg = _AutoConfig.from_pretrained(
+                self.config.training.start_from_checkpoint,
+                **self.transformers_loading_kwargs,
+            )
+            for _k in (
+                "tune_llm", "tune_visual", "tune_projector", "tune_diffusion_model",
+                "tune_vlln", "tune_top_llm_layers", "state_dropout_prob",
+                "backbone_trainable_params_fp32", "hamlet_mode", "n_moment_tokens",
+                "memory_window", "memory_num_layers", "memory_stride", "mem_cond_type",
+                "mem_fs_inject", "mem_film_layers", "mem_source", "mem_framesamp_budget",
+                "mem_framesamp_frames", "mem_fs_select", "mem_fs_diff_stride",
+                "mem_fs_attn_layer", "mem_fs_diff_share",
+                "mem_image_side", "freeze_moment_tokens",
+                "memory_type", "tcl_tau", "tcl_no_projection_head", "mem_window_mode",
+                "memory_arch", "memory_hidden", "memory_state_dim",
+                "memory_scales", "memory_scales_uniform", "memory_scales_dog", "memory_comm",
+                "memory_aux_lambda", "memory_aux_horizons", "memory_aux_warmup_steps",
+                "memory_aux_ema", "memory_aux_detach_moment",
+            ):
+                setattr(_ckpt_cfg, _k, getattr(self.config.model, _k))
+
+            # All tune_*/mem_*/hamlet_* overrides are now baked into `_ckpt_cfg` above and
+            # passed via `config=`. Do NOT also pass them as loose kwargs: with an explicit
+            # `config=`, HF forwards any remaining kwargs to the model __init__
+            # (Gr00tN1d6.__init__(config, transformers_loading_kwargs)), which would raise
+            # TypeError on unexpected args like `tune_llm`. Keep only genuine loading kwargs.
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
-                tune_llm=self.config.model.tune_llm,
-                tune_visual=self.config.model.tune_visual,
-                tune_projector=self.config.model.tune_projector,
-                tune_diffusion_model=self.config.model.tune_diffusion_model,
-                tune_vlln=self.config.model.tune_vlln,
-                state_dropout_prob=self.config.model.state_dropout_prob,
-                backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
-                # HAMLET overrides (control whether moment_tokens / memory_transformer are instantiated).
-                hamlet_mode=self.config.model.hamlet_mode,
-                n_moment_tokens=self.config.model.n_moment_tokens,
-                memory_window=self.config.model.memory_window,
-                memory_num_layers=self.config.model.memory_num_layers,
-                memory_stride=self.config.model.memory_stride,
-                mem_cond_type=self.config.model.mem_cond_type,
-                freeze_moment_tokens=self.config.model.freeze_moment_tokens,
-                memory_type=self.config.model.memory_type,
-                tcl_tau=self.config.model.tcl_tau,
+                config=_ckpt_cfg,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
                 **self.transformers_loading_kwargs,
@@ -110,6 +130,10 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 "memory_transformer",
                 "moment_to_repr",
                 "mem_adaln_pool",
+                "mem_film",
+                "spatial_cross_attn",  # dual: h_spatial cross-attn (absent from a moment ckpt)
+                "norm_spatial",
+                "fs_inject",  # v2b: framesamp-injection modules (absent from base/dual ckpts)
             )
 
             def _is_tolerated(k: str) -> bool:
@@ -146,11 +170,61 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                             if isinstance(m, torch.nn.Linear):
                                 m.weight.data.normal_(mean=0.0, std=0.02)
                     if (
+                        getattr(model.action_head, "fs_inject_tf", None) is not None
+                        and any("fs_inject" in k for k in tolerated_missing)
+                    ):
+                        # v2b: contextualizer normal-init; projection ZERO-init (weight AND
+                        # bias) so the injection starts as a strict no-op.
+                        for m in model.action_head.fs_inject_tf.modules():
+                            if isinstance(m, torch.nn.Linear):
+                                m.weight.data.normal_(mean=0.0, std=0.02)
+                        for n, p in model.action_head.fs_inject_tf.named_parameters():
+                            if "norm" in n:
+                                p.data.fill_(1.0)
+                        model.action_head.fs_inject_proj.weight.data.zero_()
+                        if model.action_head.fs_inject_proj.bias is not None:
+                            model.action_head.fs_inject_proj.bias.data.zero_()
+                    if (
                         getattr(model.action_head, "mem_adaln_pool", None) is not None
                         and any("mem_adaln_pool" in k for k in tolerated_missing)
                     ):
                         # AdaLN-zero pool: proj zero-init (no-op), attention query/attn proper init.
                         model.action_head.mem_adaln_pool.reset_parameters()
+                    if any(".mem_film." in k for k in tolerated_missing):
+                        # 'modul' memory FiLM: normal-init the cross-attn, ZERO-init scale/shift
+                        # (-> FiLM identity at start, safe for fine-tuning).
+                        for _blk in getattr(model.action_head.model, "transformer_blocks", []):
+                            _mf = getattr(_blk, "mem_film", None)
+                            if _mf is None:
+                                continue
+                            for _m in _mf.attn.modules():
+                                if isinstance(_m, torch.nn.Linear):
+                                    _m.weight.data.normal_(mean=0.0, std=0.02)
+                                    if _m.bias is not None:
+                                        _m.bias.data.zero_()
+                            _mf.to_scale_shift.weight.data.zero_()
+                            _mf.to_scale_shift.bias.data.zero_()
+                    if any("spatial_cross_attn" in k or "norm_spatial" in k for k in tolerated_missing):
+                        # dual: normal-init the spatial cross-attn Q/K/V, ZERO-init its output proj
+                        # -> spatial branch == identity at init -> warm-start step-0 == moment 18.4 (no NaN).
+                        for _name, _mod in model.named_modules():
+                            if _name.endswith("spatial_cross_attn"):
+                                for _m in _mod.modules():
+                                    if isinstance(_m, torch.nn.Linear):
+                                        _m.weight.data.normal_(mean=0.0, std=0.02)
+                                        if _m.bias is not None:
+                                            _m.bias.data.zero_()
+                                _mod.to_out[0].weight.data.zero_()
+                                if _mod.to_out[0].bias is not None:
+                                    _mod.to_out[0].bias.data.zero_()
+                            elif _name.endswith("norm_spatial"):
+                                # norm_spatial is a LayerNorm that may be built with
+                                # elementwise_affine=False (weight/bias are None) — guard the
+                                # affine re-init so it doesn't crash on the None params.
+                                if getattr(_mod, "weight", None) is not None:
+                                    _mod.weight.data.fill_(1.0)
+                                if getattr(_mod, "bias", None) is not None:
+                                    _mod.bias.data.zero_()
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])

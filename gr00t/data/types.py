@@ -83,6 +83,25 @@ class ModalityConfig:
     mean_std_embedding_keys: list[str] | None = None
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
     action_configs: list[ActionConfig] | None = None
+    framesamp_frames: int = 0
+    """HAMLET `mem_source='framesamp'` only (video modality). If >0, the loader appends this
+    many EPISODE-SPANNING frames (even `linspace` over [0, episode_len-1]) AFTER the
+    delta_indices frames, in the same video stream. 0 (default) = no extra frames, so the
+    loader behaves exactly as before for every non-framesamp config."""
+    framesamp_select: str = "linspace"
+    """How the loader picks the framesamp_frames episode frames. "linspace" (default) =
+    even spacing over the WHOLE episode (acausal — includes frames after the anchor;
+    current behavior). "diff" = CAUSAL TokenDrop-style keyframes: frame 0 + top-(F-2)
+    pixel-difference-scored steps <= anchor + the anchor frame — matching the
+    inference-side DiffFrameSelector (model mem_fs_select='diff')."""
+    framesamp_diff_stride: int = 8
+    """Scoring cadence (in env steps) for framesamp_select='diff' (TokenDrop stride)."""
+    mem_window_mode: str = "recent"
+    """HAMLET moment memory window sampling (video modality). "recent" (default) = the
+    delta_indices recent-stride K-window (current behavior). "linspace" = CAUSAL
+    episode-spanning: the K memory-window frames are `linspace(0, anchor, K)` over the
+    history-so-far [0, current_step] (past only, so train/inference match), instead of the
+    recent stride window. Reuses the same moment read-out; only WHICH frames change."""
 
     def __post_init__(self):
         """Set default values for action-related fields if not specified."""

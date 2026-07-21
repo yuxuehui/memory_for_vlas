@@ -11,6 +11,46 @@ from torch import nn
 import torch.nn.functional as F
 
 
+def resolve_mem_film_layers(spec, num_layers: int) -> set:
+    """Resolve a `mem_film_layers` spec (mem_cond_type='modul' injection-depth control)
+    to the set of DiT block indices that should carry a `MemoryFiLM`.
+
+    Accepted forms (backward-compatible default is "all" = every block):
+      - "all"                : {0, .., num_layers-1}  (current behavior).
+      - "mid"                : a mid-deep band [num_layers//4 .. 5*num_layers//8)
+                               (e.g. [8..20) of 32) — the empirically good depth.
+      - list/tuple of ints   : those indices verbatim, e.g. [8, 10, 12, 14, 16, 18, 20].
+      - "8,10,12"            : comma-separated explicit indices.
+      - "8-20" / "8:20"      : a (start, end) HALF-OPEN range -> range(8, 20).
+      - (start, end)         : same, as a 2-tuple.
+    Out-of-range indices are dropped; the result is clamped to [0, num_layers).
+    """
+    if spec is None or spec == "all":
+        return set(range(num_layers))
+    if spec == "mid":
+        start = num_layers // 4
+        end = (5 * num_layers) // 8
+        return {i for i in range(start, end) if 0 <= i < num_layers}
+    if isinstance(spec, (list, tuple, set)):
+        # A 2-tuple is treated as a (start, end) half-open range; any other
+        # list/tuple/set is an explicit index collection.
+        if isinstance(spec, tuple) and len(spec) == 2 and all(isinstance(v, int) for v in spec):
+            start, end = spec
+            return {i for i in range(int(start), int(end)) if 0 <= i < num_layers}
+        return {int(i) for i in spec if 0 <= int(i) < num_layers}
+    if isinstance(spec, str):
+        s = spec.strip()
+        for sep in ("-", ":"):
+            if sep in s:
+                start, end = s.split(sep)
+                return {i for i in range(int(start), int(end)) if 0 <= i < num_layers}
+        if "," in s:
+            return {int(tok) for tok in s.split(",") if tok.strip() != "" and 0 <= int(tok) < num_layers}
+        # A single integer index as a string.
+        return {int(s)} if 0 <= int(s) < num_layers else set()
+    raise ValueError(f"Unrecognized mem_film_layers spec: {spec!r}")
+
+
 def _is_spark_sm121() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -82,6 +122,54 @@ class AdaLayerNorm(nn.Module):
         return x
 
 
+class MemoryFiLM(nn.Module):
+    """MME-VLA-style memory modulation (`mem_cond_type='modul'`).
+
+    The action (query) tokens cross-attend to the memory sequence, and the attended
+    result FiLM-modulates them per-token:  x -> x*(1+scale)+shift , where (scale,shift)
+    come from a zero-initialized projection of the cross-attention output.
+    Zero-init => identity at start (safe to fine-tune from a memory-less init), and it
+    keeps the memory as a *sequence* (cross-attn selects) while injecting it via FiLM
+    (forced in), per block — richer than HAMLET's pooled `adaln`.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        mem_dim: int,
+        num_heads: int,
+        head_dim: int,
+        dropout: float = 0.0,
+        upcast_attention: bool = False,
+        norm_eps: float = 1e-5,
+    ):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=False)
+        self.attn = Attention(
+            query_dim=dim,
+            heads=num_heads,
+            dim_head=head_dim,
+            dropout=dropout,
+            bias=False,
+            cross_attention_dim=mem_dim,
+            upcast_attention=upcast_attention,
+            out_bias=True,
+        )
+        self.to_scale_shift = nn.Linear(dim, 2 * dim)
+        nn.init.zeros_(self.to_scale_shift.weight)
+        nn.init.zeros_(self.to_scale_shift.bias)
+
+    def forward(self, hidden_states, mem_seq, mem_mask=None):
+        with _sdpa_context():
+            mod = self.attn(
+                self.norm_q(hidden_states),
+                encoder_hidden_states=mem_seq,
+                attention_mask=mem_mask,
+            )
+        scale, shift = self.to_scale_shift(mod).chunk(2, dim=-1)
+        return hidden_states * (1 + scale) + shift
+
+
 class BasicTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -103,6 +191,8 @@ class BasicTransformerBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
+        mem_cross_attention_dim: Optional[int] = None,
+        spatial_cross_attention_dim: Optional[int] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -147,6 +237,49 @@ class BasicTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
         )
 
+        # 2b. Memory modulation (mem_cond_type='modul'): cross-attn to the memory sequence -> FiLM.
+        self.mem_film = (
+            MemoryFiLM(
+                dim,
+                mem_cross_attention_dim,
+                num_attention_heads,
+                attention_head_dim,
+                dropout=dropout,
+                upcast_attention=upcast_attention,
+                norm_eps=norm_eps,
+            )
+            if mem_cross_attention_dim is not None
+            else None
+        )
+
+        # 2c. Spatial memory cross-attention (mem_cond_type='dual', the h_spatial / AC channel).
+        # A SEPARATE cross-attention (own softmax) over the raw per-position framesamp tokens,
+        # applied as a plain RESIDUAL ADD (NOT FiLM, NOT concatenated into the main KV). Its
+        # output projection is zero-initialized so the branch contributes exactly 0 at init ->
+        # a freshly built dual model forward == the moment-only baseline forward (step-0 == 18.4).
+        if spatial_cross_attention_dim is not None:
+            self.norm_spatial = nn.LayerNorm(
+                dim, eps=norm_eps, elementwise_affine=norm_elementwise_affine
+            )
+            self.spatial_cross_attn = Attention(
+                query_dim=dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                cross_attention_dim=spatial_cross_attention_dim,
+                upcast_attention=upcast_attention,
+                out_bias=attention_out_bias,
+            )
+            # Zero-init the output projection (to_out[0] Linear: weight + bias) so the attention
+            # output is identically 0 at init, hence the residual `spa + hidden_states` == identity.
+            nn.init.zeros_(self.spatial_cross_attn.to_out[0].weight)
+            if self.spatial_cross_attn.to_out[0].bias is not None:
+                nn.init.zeros_(self.spatial_cross_attn.to_out[0].bias)
+        else:
+            self.norm_spatial = None
+            self.spatial_cross_attn = None
+
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
         self.ff = FeedForward(
@@ -169,6 +302,10 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
+        mem_seq: Optional[torch.Tensor] = None,
+        mem_mask: Optional[torch.Tensor] = None,
+        mem_seq_spatial: Optional[torch.Tensor] = None,
+        mem_spatial_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # 0. Self-Attention
         if self.norm_type == "ada_norm":
@@ -193,6 +330,22 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = attn_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
+
+        # 2a. Spatial memory cross-attention (dual / h_spatial): a SEPARATE cross-attn over the
+        # raw framesamp tokens, residual-added (own softmax, not concatenated into the main KV).
+        # Zero-init output projection -> contributes 0 at init (step-0 == moment-only baseline).
+        if self.spatial_cross_attn is not None and mem_seq_spatial is not None:
+            with _sdpa_context():
+                spa = self.spatial_cross_attn(
+                    self.norm_spatial(hidden_states),
+                    encoder_hidden_states=mem_seq_spatial,
+                    attention_mask=mem_spatial_mask,
+                )
+            hidden_states = spa + hidden_states
+
+        # 2b. Memory modulation (modul): action tokens cross-attend memory -> FiLM (identity at init).
+        if self.mem_film is not None and mem_seq is not None:
+            hidden_states = self.mem_film(hidden_states, mem_seq, mem_mask)
 
         # 4. Feed-forward
         norm_hidden_states = self.norm3(hidden_states)
@@ -228,6 +381,9 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        mem_cross_attention_dim: Optional[int] = None,
+        mem_film_layers="all",
+        spatial_cross_attention_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -240,10 +396,30 @@ class DiT(ModelMixin, ConfigMixin):
             embedding_dim=self.inner_dim, compute_dtype=self.compute_dtype
         )
 
+        # mem_cond_type='modul' injection-DEPTH control: which block indices get MemoryFiLM.
+        # Unselected blocks pass mem_cross_attention_dim=None -> no module, no apply (default
+        # "all" reproduces the every-block behavior exactly).
+        self.mem_film_block_idxs = (
+            resolve_mem_film_layers(mem_film_layers, self.config.num_layers)
+            if mem_cross_attention_dim is not None
+            else set()
+        )
+
         all_blocks = []
         for idx in range(self.config.num_layers):
             use_self_attn = idx % 2 == 1 and interleave_self_attention
             curr_cross_attention_dim = cross_attention_dim if not use_self_attn else None
+            curr_mem_cross_attention_dim = (
+                mem_cross_attention_dim if idx in self.mem_film_block_idxs else None
+            )
+            # mem_cond_type='dual': every CROSS-attn block (the blocks that already cross-attend
+            # the backbone KV; self-attn blocks have no encoder KV) gets a spatial cross-attn over
+            # the framesamp tokens. Default = ALL cross-attn blocks (deliberately not mid-deep).
+            curr_spatial_cross_attention_dim = (
+                spatial_cross_attention_dim
+                if (spatial_cross_attention_dim is not None and not use_self_attn)
+                else None
+            )
 
             all_blocks += [
                 BasicTransformerBlock(
@@ -261,6 +437,8 @@ class DiT(ModelMixin, ConfigMixin):
                     num_positional_embeddings=self.config.max_num_positional_embeddings,
                     final_dropout=final_dropout,
                     cross_attention_dim=curr_cross_attention_dim,
+                    mem_cross_attention_dim=curr_mem_cross_attention_dim,
+                    spatial_cross_attention_dim=curr_spatial_cross_attention_dim,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
@@ -282,6 +460,10 @@ class DiT(ModelMixin, ConfigMixin):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
         temb_add: Optional[torch.Tensor] = None,
+        mem_seq: Optional[torch.Tensor] = None,
+        mem_mask: Optional[torch.Tensor] = None,
+        mem_seq_spatial: Optional[torch.Tensor] = None,
+        mem_spatial_mask: Optional[torch.Tensor] = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -304,6 +486,10 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    mem_seq=mem_seq,
+                    mem_mask=mem_mask,
+                    mem_seq_spatial=mem_seq_spatial,
+                    mem_spatial_mask=mem_spatial_mask,
                 )
             else:
                 hidden_states = block(
@@ -312,6 +498,10 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
+                    mem_seq=mem_seq,
+                    mem_mask=mem_mask,
+                    mem_seq_spatial=mem_seq_spatial,
+                    mem_spatial_mask=mem_spatial_mask,
                 )
             all_hidden_states.append(hidden_states)
 
@@ -345,6 +535,10 @@ class AlternateVLDiT(DiT):
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
         temb_add: Optional[torch.Tensor] = None,
+        mem_seq: Optional[torch.Tensor] = None,
+        mem_mask: Optional[torch.Tensor] = None,
+        mem_seq_spatial: Optional[torch.Tensor] = None,
+        mem_spatial_mask: Optional[torch.Tensor] = None,
     ):
         assert image_mask is not None, "Image mask is required"
 
@@ -378,6 +572,10 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    mem_seq=mem_seq,
+                    mem_mask=mem_mask,
+                    mem_seq_spatial=mem_seq_spatial,
+                    mem_spatial_mask=mem_spatial_mask,
                 )
             else:
                 # Cross-attention blocks - alternate between non-image and image tokens
@@ -394,6 +592,10 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=curr_encoder_attention_mask,
                     temb=temb,
+                    mem_seq=mem_seq,
+                    mem_mask=mem_mask,
+                    mem_seq_spatial=mem_seq_spatial,
+                    mem_spatial_mask=mem_spatial_mask,
                 )
             all_hidden_states.append(hidden_states)
 

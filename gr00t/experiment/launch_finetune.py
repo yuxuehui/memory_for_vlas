@@ -80,6 +80,7 @@ if __name__ == "__main__":
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
+    config.training.max_grad_norm = ft_config.max_grad_norm
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps
@@ -102,9 +103,35 @@ if __name__ == "__main__":
     config.model.n_moment_tokens = ft_config.n_moment_tokens
     config.model.memory_window = ft_config.memory_window
     config.model.memory_num_layers = ft_config.memory_num_layers
+    config.model.memory_arch = ft_config.memory_arch
+    config.model.memory_hidden = ft_config.memory_hidden
+    config.model.memory_state_dim = ft_config.memory_state_dim
+    # Multi-scale memory (V1/V2)
+    config.model.memory_scales = ft_config.memory_scales
+    config.model.memory_scales_uniform = ft_config.memory_scales_uniform
+    config.model.memory_scales_dog = ft_config.memory_scales_dog
+    config.model.memory_comm = ft_config.memory_comm
+    config.model.memory_aux_lambda = ft_config.memory_aux_lambda
+    config.model.memory_aux_horizons = ft_config.memory_aux_horizons
+    config.model.memory_aux_warmup_steps = ft_config.memory_aux_warmup_steps
+    config.model.memory_aux_ema = ft_config.memory_aux_ema
+    config.model.memory_aux_detach_moment = ft_config.memory_aux_detach_moment
     config.model.memory_stride = ft_config.memory_stride
     config.model.mem_cond_type = ft_config.mem_cond_type
+    config.model.mem_fs_inject = ft_config.mem_fs_inject
     config.model.memory_type = ft_config.memory_type
+    config.model.mem_film_layers = ft_config.mem_film_layers
+    config.model.mem_source = ft_config.mem_source
+    config.model.mem_framesamp_budget = ft_config.mem_framesamp_budget
+    config.model.mem_framesamp_frames = ft_config.mem_framesamp_frames
+    # TokenDrop-style diff keyframes: stamp the model config so the SAVED CHECKPOINT
+    # defaults to the matching inference selector (mem_fs_select='diff').
+    config.model.mem_fs_select = ft_config.mem_fs_select
+    config.model.mem_fs_diff_stride = ft_config.mem_fs_diff_stride
+    config.model.mem_fs_attn_layer = ft_config.mem_fs_attn_layer
+    config.model.mem_fs_diff_share = ft_config.mem_fs_diff_share
+    config.model.mem_image_side = ft_config.mem_image_side
+    config.model.mem_window_mode = ft_config.mem_window_mode
     if (
         ft_config.hamlet_mode == "finetune"
         and ft_config.freeze_moment_tokens
@@ -117,6 +144,10 @@ if __name__ == "__main__":
         )
     config.model.freeze_moment_tokens = ft_config.freeze_moment_tokens
     config.model.tcl_tau = ft_config.tcl_tau
+    config.model.tcl_no_projection_head = ft_config.tcl_no_projection_head
+    # Trainability is now an explicit per-stage knob (Stage-1 sets 0, Stage-2 keeps 4),
+    # not an inline mode override. See run_scripts/train_tcl_stage1.sh vs train_hamlet_stage2.sh.
+    config.model.tune_top_llm_layers = ft_config.tune_top_llm_layers
     config.training.load_moment_tokens_from = ft_config.load_moment_tokens_from
 
     # HAMLET — override video delta_indices on the registered modality configs.
@@ -125,11 +156,43 @@ if __name__ == "__main__":
         stride = ft_config.memory_stride
         K = ft_config.memory_window
         new_indices = [-(K - 1 - i) * stride for i in range(K)]
+        # mem_source='framesamp': in ADDITION to the K-step memory-window frames, ask the
+        # loader to append `mem_framesamp_frames` EPISODE-SPANNING linspace frames to the same
+        # video stream (handled in extract_step_data via the `framesamp_frames` attribute on
+        # the video ModalityConfig). Backward-compatible: when mem_source='moment' the
+        # attribute stays 0 and the loader behaves byte-for-byte as before.
+        # mem_cond_type='dual' ALSO needs the episode-spanning framesamp frames (its h_spatial
+        # channel is built from their raw patch tokens), independent of mem_source.
+        fs_frames = (
+            int(ft_config.mem_framesamp_frames)
+            if (ft_config.mem_source == "framesamp" or ft_config.mem_cond_type == "dual")
+            else 0
+        )
         for tag in MODALITY_CONFIGS:
             if "video" in MODALITY_CONFIGS[tag]:
                 MODALITY_CONFIGS[tag]["video"].delta_indices = new_indices
+                MODALITY_CONFIGS[tag]["video"].framesamp_frames = fs_frames
+                MODALITY_CONFIGS[tag]["video"].mem_window_mode = ft_config.mem_window_mode
+                # TokenDrop-style training frames: loader selects CAUSAL diff keyframes
+                # instead of acausal whole-episode linspace (mem_fs_select='diff' only).
+                MODALITY_CONFIGS[tag]["video"].framesamp_select = (
+                    "diff" if ft_config.mem_fs_select == "diff" else "linspace"
+                )
+                MODALITY_CONFIGS[tag]["video"].framesamp_diff_stride = (
+                    ft_config.mem_fs_diff_stride
+                )
         config.data.allow_padding = True
         print(f"[HAMLET] K-step batching: stride={stride} window={(K-1)*stride} delta_indices={new_indices}")
+        if ft_config.mem_window_mode == "linspace":
+            print(
+                f"[HAMLET][episode-span] mem_window_mode=linspace: the K={K} moment-window frames "
+                f"are CAUSAL linspace(0, anchor, K) over the history-so-far (delta_indices ignored)."
+            )
+        if fs_frames > 0:
+            print(
+                f"[HAMLET][framesamp] appending {fs_frames} episode-spanning linspace frames "
+                f"per video stream (mem_framesamp_budget={ft_config.mem_framesamp_budget})"
+            )
     elif ft_config.hamlet_mode == "tcl":
         from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
         new_indices = [0, -999]
@@ -137,6 +200,11 @@ if __name__ == "__main__":
             if "video" in MODALITY_CONFIGS[tag]:
                 MODALITY_CONFIGS[tag]["video"].delta_indices = new_indices
         config.data.allow_padding = True
-        print(f"[HAMLET-TCL] video delta_indices = {new_indices}")
+        # Stage-specific numerical/trainability knobs (LR, max_grad_norm, tune_top_llm_layers,
+        # tcl_no_projection_head) come from the CLI / the Stage-1 config script — NOT hardcoded
+        # here — so Stage-1 vs Stage-2 are fully described by their own run_scripts.
+        print(f"[HAMLET-TCL] video delta_indices = {new_indices} | lr={ft_config.learning_rate} | "
+              f"max_grad_norm={ft_config.max_grad_norm} | tune_top_llm_layers={ft_config.tune_top_llm_layers} | "
+              f"no_projection_head={ft_config.tcl_no_projection_head}")
 
     run(config)

@@ -40,6 +40,33 @@ print(f"[boot] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')} 
 import imageio
 from robomme.env_record_wrapper import BenchmarkEnvBuilder
 
+
+def _import_oracle_instruction():
+    """Import the EVAL-side oracle-text generator (arm-C memory-tax experiment).
+
+    `oracle_instruction(env, task_id)` lives next to the env package at
+    `robomme.robomme_env.utils.oracle_text`; since the harness already imports
+    `robomme.env_record_wrapper`, the `robomme` package is importable and this
+    submodule resolves directly. As a defensive fallback (e.g. a bare PYTHONPATH),
+    we also add the robomme_benchmark `src` dir to sys.path, mirroring how the env
+    package itself is located. Imported lazily so the default (non-oracle) eval has
+    no extra import cost or failure mode.
+    """
+    try:
+        from robomme.robomme_env.utils.oracle_text import oracle_instruction
+        return oracle_instruction
+    except Exception:
+        try:
+            import robomme  # already-importable package -> add its parent `src` dir
+            src_dir = str(Path(robomme.__file__).resolve().parent.parent)
+            if src_dir not in sys.path:
+                sys.path.insert(0, src_dir)
+        except Exception:
+            pass
+        from robomme.robomme_env.utils.oracle_text import oracle_instruction
+        return oracle_instruction
+
+
 MEMORY_WINDOW = 4   # K — matches HAMLET memory_window training default; ignored when vanilla
 MEMORY_STRIDE = 16  # S — must match training stride (= action chunk length per HAMLET paper)
 
@@ -199,6 +226,25 @@ class Config:
     """Path to the policy checkpoint dir or its config.json. Used to resolve
     memory_window adaptively when --memory-window 0 (auto)."""
 
+    oracle_text: bool = False
+    """Arm-C "memory-tax" eval: when set, replace the per-episode language
+    instruction fed to the policy with the ORACLE instruction
+    `oracle_instruction(env, task_id)` (computed after each env.reset(), reading
+    the live GT off the env) instead of the normal under-specified goal. Default
+    OFF -> normal eval is byte-for-byte unchanged. Control tasks
+    (Counting family / MoveCube) pass through whatever the generator returns
+    (unchanged normal text for the counting controls)."""
+
+    override_instruction: str = ""
+    """Debug/probe: if non-empty, replace the per-episode task_goal with this exact
+    string for EVERY episode (applied after the oracle swap). Used to test how the
+    policy responds to a custom/self-correcting instruction (e.g. a mid-sentence
+    'No. change to ...' override). Default empty -> no effect."""
+
+    episodes: tuple[int, ...] = ()
+    """Debug/probe: if non-empty, run ONLY these episode indices (instead of 0..n_episodes).
+    Lets a probe target a curated subset (e.g. green-highlighted scenes). Default = all."""
+
 
 def _resolve_memory_params(cfg: Config) -> tuple[int, int]:
     """Resolve the priming window K and memory stride S from the checkpoint's
@@ -272,6 +318,13 @@ def main(cfg: Config) -> None:
 
     memory_window, memory_stride = _resolve_memory_params(cfg)
 
+    # Arm-C oracle-text eval: resolve the oracle generator once (lazy import) so a
+    # per-episode reset can Markov-ize the instruction. Default OFF -> None.
+    oracle_instruction = None
+    if cfg.oracle_text:
+        oracle_instruction = _import_oracle_instruction()
+        print(f"[i] ORACLE-TEXT eval ON: per-episode instruction = oracle_instruction(env, '{cfg.task_id}')")
+
     out_dir = Path(cfg.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "simulation_results.csv"
@@ -306,7 +359,8 @@ def main(cfg: Config) -> None:
     n_episodes_total = min(cfg.n_episodes, env_builder.get_episode_num())
 
     start_t = time.time()
-    for ep in range(n_episodes_total):
+    ep_list = list(cfg.episodes) if cfg.episodes else list(range(n_episodes_total))
+    for ep in ep_list:
         if ep in done_eps:
             print(f"[i] Skipping episode {ep} (already complete)")
             continue
@@ -315,6 +369,17 @@ def main(cfg: Config) -> None:
         env = env_builder.make_env_for_episode(ep, max_steps=cfg.max_episode_steps)
         env_obs, info = env.reset()
         task_goal = info["task_goal"][0]
+        # Arm-C: replace the normal under-specified goal with the oracle instruction
+        # (reads live GT off the just-reset env). This is the only string the policy
+        # ever sees as the task description -> _prime_hamlet_memory / _build_step_obs
+        # below both take `task_goal`, so the swap propagates everywhere.
+        if oracle_instruction is not None:
+            normal_goal = task_goal
+            task_goal = oracle_instruction(env, cfg.task_id)
+            print(f"[i] ep={ep} ORACLE goal='{task_goal[:100]}' (normal was '{normal_goal[:60]}...')")
+        if cfg.override_instruction:
+            task_goal = cfg.override_instruction
+            print(f"[i] ep={ep} OVERRIDE goal='{task_goal[:120]}'")
         print(f"[i] ep={ep} task_goal='{task_goal[:80]}...' demo_frames={len(env_obs['front_rgb_list']) - 1}")
 
         _prime_hamlet_memory(policy, env_obs, session_id, task_goal, memory_window, memory_stride)

@@ -109,6 +109,25 @@ class Gr00tN1d6Config(PretrainedConfig):
     n_moment_tokens: int = 4
     memory_window: int = 4
     memory_num_layers: int = 2
+    # HAMLET memory aggregator architecture over the K-step moment-token history:
+    #   "transformer" (default) = block-causal MemoryTransformer (attention);
+    #   "gru" | "ssm" (S4D) | "mamba" (selective SSM) = explicit recurrent/state-space memory
+    #   (drop-in SequenceMemory) that accumulates "what events have happened" as a running state.
+    memory_arch: str = "transformer"
+    memory_hidden: int = 512      # SequenceMemory bottleneck width (gru/ssm/mamba)
+    memory_state_dim: int = 64    # SSM state size per layer (ssm/mamba)
+    # MULTI-SCALE memory (V1/V2, Markdown/10_multiscale_temporal_memory.md). memory_scales =
+    # comma-separated ascending window lengths ("2,8,16"; max MUST equal memory_window; "" = off).
+    # One aggregator per scale over suffix windows; all current read-outs concat into the KV tail.
+    memory_scales: str = ""
+    memory_scales_uniform: bool = False   # + per-scale uniform-mean tokens (guaranteed sinc response)
+    memory_scales_dog: bool = False       # + adjacent-scale difference tokens (band-pass)
+    memory_comm: bool = False             # V2 coarse->fine zero-init cross-attn communication
+    memory_aux_lambda: float = 0.0        # V2 per-scale BYOL predictive-loss weight (0 = off)
+    memory_aux_horizons: str = ""         # V2 per-scale horizons; "" = auto (skip K_l == K)
+    memory_aux_warmup_steps: int = 2000   # V2 aux-lambda linear warmup (per training forward)
+    memory_aux_ema: float = 0.996         # V2 fp32 EMA momentum for the BYOL target encoder
+    memory_aux_detach_moment: bool = False  # V2 detach moment tokens for the online aux branch
     # Env steps between cached memory snapshots; persisted to the checkpoint
     # config so evaluation can enforce n_action_steps == memory_stride.
     memory_stride: int = 16
@@ -122,8 +141,55 @@ class Gr00tN1d6Config(PretrainedConfig):
     mem_cond_type: str = "cross_attn"
     # What flows through the memory module: {"moment_token", "vision_feature"}.
     memory_type: str = "moment_token"
+    # mem_cond_type=="modul" only. Injection-DEPTH control: which DiT blocks get a
+    # MemoryFiLM. "all" (default) = every block (current behavior); "mid" = a mid-deep
+    # band; "8,10,12" = explicit indices; "8-20"/"8:20" = a (start, end) range.
+    mem_film_layers: str = "all"
+    # mem_cond_type=="modul" only. Memory-RICHNESS control: what the FiLM cross-attends.
+    # "moment" (default) = compressed K*n_q moment tokens (current behavior); "framesamp" =
+    # many raw per-frame vision tokens (linspace sub-sample) capped at mem_framesamp_budget.
+    mem_source: str = "moment"
+    # Moment-memory window sampling. "recent" (default) = recent-stride K-window (current
+    # behavior); "linspace" = CAUSAL episode-spanning K-window (linspace over [0, current_step],
+    # past only) so train & inference match. Used at inference to switch the rolling cache from
+    # recent-FIFO to a full-buffer + linspace subsample. Orthogonal to mem_source.
+    mem_window_mode: str = "recent"
+    mem_framesamp_budget: int = 512
+    # mem_source=="framesamp" only. Number of EPISODE-SPANNING video frames the loader
+    # even-linspace-samples across the WHOLE episode (independent of memory_window/stride),
+    # appended after the K-step memory-window frames in the same video stream so the model
+    # can slice them off the backbone rows and build the framesamp mem_seq from raw patch
+    # tokens. Ignored unless mem_source=="framesamp".
+    mem_framesamp_frames: int = 8
+    # mem_source=="framesamp", INFERENCE-only. Frame selection for the rolling cache:
+    # "fifo" (default) = recent-F window (current behavior); "diff" = TokenDrop-style
+    # pixel-difference keyframes (RoboMME mem_buffer.py, frame-level): frame 0 + running
+    # top-(F-2) by mean |pixel diff| at mem_fs_diff_stride + current frame. Fixes the
+    # recent-FIFO losing demo/early events on long episodes (train frames are
+    # episode-spanning linspace; see Markdown/vlm_keyframe_labels probe). Training is
+    # unaffected — the loader path never reads this.
+    mem_fs_select: str = "fifo"
+    # Scoring cadence for mem_fs_select=="diff"/"patch_union", in policy calls.
+    mem_fs_diff_stride: int = 8
+    # mem_fs_select=="patch_union" only: DiT cross-attn layer for the attention
+    # channel, and the diff channel share of the patch budget.
+    mem_fs_attn_layer: int = 13
+    mem_fs_diff_share: float = 0.5
+    # mem_cond_type=="cross_attn" only. Cross-attn ROUTING for the memory tokens that ride
+    # the action-head KV. False (default) = memory tagged image_mask=False (TEXT pathway,
+    # current behavior); True = memory tagged image_mask=True (IMAGE pathway). Only the
+    # cross_attn paths are affected (modul/adaln slice the moment tail off the KV).
+    mem_image_side: bool = False
+    # mem_cond_type=="dual" only (v2b, Markdown/16). Inject per-frame memory state into the
+    # framesamp h_spatial tokens: "none" (default, byte-identical v1 dual) | "te" (sinusoidal
+    # frame-index, ordering-only ablation) | "moment" (per-frame raw tails contextualized in
+    # episode order by a dedicated block-causal MemoryTransformer; zero-init projection).
+    mem_fs_inject: str = "none"
     # If None, defaults to `action_horizon` at runtime.
     tcl_tau: float = 0.07
+    # Stage-1 (TCL) only: drop the moment_to_repr projection head (InfoNCE on the pooled
+    # moment-token repr directly), so the moment tokens are the only trainable path.
+    tcl_no_projection_head: bool = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
