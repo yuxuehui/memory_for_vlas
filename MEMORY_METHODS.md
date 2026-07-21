@@ -20,6 +20,7 @@ codebase** — a method is a combination of config flags, not a branch.
 |---|---|---|
 | **vanilla** | `--hamlet-mode off` | — （单帧反应式策略；GR00T 的 obs horizon = 1） |
 | **HAMLET（压缩记忆）** | `--hamlet-mode finetune --mem-source moment` | `modules/memory.py`（`MemoryTransformer`）· `seq_memory.py`（GRU/SSM/Mamba 变体）· `multiscale_memory.py` |
+| **Multi-resolution memory（read-out 融进 image token）** | `--mem-cond-type dual --mem-fs-inject moment` | `gr00t_n1d6.py::_fs_inject_states` + `modules/dit.py`（spatial cross-attn）· 见 §5a |
 | **framesamp（均匀关键帧）** | `--mem-source framesamp --mem-fs-select fifo` | `gr00t_n1d6.py::_framesamp_mem_seq` + loader linspace |
 | **tokendrop（diff 关键帧）** | `--mem-source framesamp --mem-fs-select diff` | `modules/fs_diff_select.py` + loader `_fs_diff_scores` / `_fs_diff_indices` |
 | **Action-conditioned patch memory（patch_union）** | `--mem-source framesamp --mem-fs-select patch_union` | `modules/fs_patch_union.py` + `gr00t_n1d6.py::_patch_union_mem_seq` / `_patch_union_score_pass` / `_pu_commit` |
@@ -47,15 +48,16 @@ the ceiling is the **pooling operation**, not the token count.
 
 **Two routes out of the low-pass ceiling** (and how this repo explores them):
 1. **Un-pool → keep raw per-position tokens** (`A=I`): the **FrameSamp** path (family ①), and the
-   **`h_spatial`** channel of **`v2b-fix`**.
+   **`h_spatial`** channel of **Multi-resolution memory**.
 2. **Replace attention-pooling with a non-low-pass aggregator**: the **`SequenceMemory`** recurrent/SSM
    memories (`--memory-arch gru|ssm|mamba`) — a learned *selective* running state instead of a softmax
    average (e.g. count-/event-tracking), rather than a DC summary.
 
-**`v2b-fix`** is the **hybrid** that keeps the read-out's useful low-pass summary **and** its register effect
-(freeing the action query from image-background patches) **while** adding raw spatial detail back — and it
-fixes the plain-hybrid's aliasing problem by **injecting each frame's memory state into its own framesamp
-tokens** (`--mem-fs-inject moment`), so episode-spanning frames stop being indistinguishable.
+**Multi-resolution memory** is the **hybrid** that keeps the read-out's useful low-pass summary **and** its
+register effect (freeing the action query from image-background patches) **while** adding raw spatial detail
+back — and it **fuses** the two resolutions instead of merely concatenating them: each frame's raw image
+tokens are injected with that frame's own read-out state (`--mem-fs-inject moment`), so episode-spanning
+frames stop being indistinguishable to the policy.
 
 ---
 
@@ -72,7 +74,7 @@ into the action head*). The two axes are **orthogonal** — any memory pairs wit
 |---|---|---|---|---|
 | **Read-out (HAMLET)** | ② read-out summary | K past sets of `n_q` learnable moment tokens, compressed by the aggregator → a low-pass (DC) summary of the history | `--n-moment-tokens <n_q>` | ✅ main recipe (~18.4) |
 | **FrameSamp (raw tokens)** | ① raw tokens | F episode-spanning frames' **raw vision patch tokens** (≤ budget) — uncompressed spatial/temporal detail | `--mem-source framesamp --mem-framesamp-frames 8 --mem-framesamp-budget 512` | ✅ |
-| **v2b-fix (hybrid)** | ①+② the proposed fix | **both at once**: read-out (`h_sem`) **+** raw framesamp (`h_spatial`, zero-init per-block spatial cross-attn), with each frame's tokens **colored by its own memory state** (block-causal, zero-init proj) so repeated frames are no longer aliased | `--mem-cond-type dual --mem-fs-inject moment --mem-framesamp-frames 8` | ✅ (DONE: @60k **11.1 %**; see `../Markdown/16_memory_into_image_tokens.md`) |
+| **Multi-resolution memory** (hybrid) | ①+② the proposed fix | **both at once**: read-out (`h_sem`) **+** raw framesamp (`h_spatial`, zero-init per-block spatial cross-attn), with each frame's tokens **colored by its own memory state** (block-causal, zero-init proj) so repeated frames are no longer aliased | `--mem-cond-type dual --mem-fs-inject moment --mem-framesamp-frames 8` | ✅ @60k **11.1 %** (§5a; `../Markdown/16_memory_into_image_tokens.md`) |
 
 ### (1b) Keyframe selection — *which frames/patches enter the fixed budget*
 
@@ -102,9 +104,9 @@ which is historically mismatched — see caveats):
   (default, block-causal attention) · `gru` · `ssm` (S4D) · `mamba` (selective SSM). The recurrent/SSM
   variants replace softmax-pooling with a learned running state (count/event tracking — a *non*-low-pass
   alternative). `mamba` (`exp_mamba/mamba_b`, K=16, hidden 512, state 64): **@40k = 11.5 %** — above vanilla
-  8.25 / v2b-fix 11.1, but below framesamp 12.4 and the moment bar 18.38 on *every* suite (Counting 17.0/24.5,
+  8.25 / multi-resolution 11.1, but below framesamp 12.4 and the moment bar 18.38 on *every* suite (Counting 17.0/24.5,
   Permanence 10.5/17.0, Reference 13.0/21.5, Imitation 5.5/10.5; best tasks SwingXtimes 32, VideoPlaceOrder 18).
-  ⚠️ run cut at **40k of 60k** (VM deleted) — undertrained confound LIVE (cf. v2b-fix jumped +4.9 at 40k→50k);
+  ⚠️ run cut at **40k of 60k** (VM deleted) — undertrained confound LIVE (cf. multi-resolution jumped +4.9 at 40k→50k);
   ckpts 10k–40k in `gs://…/exp_mamba/mamba_b/`, eval CSVs `/tmp/robomme_eval/out_mamba_40k/`.
 - **History coverage** — `--mem-window-mode recent` (recent K-stride window, default) vs `linspace` (causal
   whole-episode coverage). Orthogonal to everything above.
@@ -128,7 +130,7 @@ Everything is a flag on `gr00t/experiment/launch_finetune.py` (`gr00t/configs/fi
 | Flag | Default | Choices | Meaning |
 |---|---|---|---|
 | `--hamlet-mode` | `finetune` | `off` / `tcl` / `finetune` | stage gate: vanilla / Stage-1 TCL pretrain / Stage-2 memory+head |
-| `--mem-cond-type` | `cross_attn` | `cross_attn` / `adaln` / `modul` / `dual` | **how** memory conditions the DiT (`dual` = the v2b-fix hybrid's two-channel wiring) |
+| `--mem-cond-type` | `cross_attn` | `cross_attn` / `adaln` / `modul` / `dual` | **how** memory conditions the DiT (`dual` = Multi-resolution memory's two-channel wiring) |
 | `--memory-arch` | `transformer` | `transformer` / `gru` / `ssm` / `mamba` | **aggregator** over the K·n_q history |
 | `--mem-source` | `moment` | `moment` / `framesamp` | compressed moment tokens vs raw per-frame patches (`modul` only) |
 | `--mem-window-mode` | `recent` | `recent` / `linspace` | recent K-stride window vs causal whole-episode coverage (`moment` only) |
@@ -139,8 +141,8 @@ Everything is a flag on `gr00t/experiment/launch_finetune.py` (`gr00t/configs/fi
 | `--memory-num-layers` | `2` | int | aggregator depth |
 | `--memory-hidden` | `512` | int | SequenceMemory bottleneck (`gru/ssm/mamba`) |
 | `--memory-state-dim` | `64` | int | SSM state size (`ssm/mamba`) |
-| `--mem-framesamp-frames` | `8` | int | episode-spanning frames the loader appends (**required >0** for `framesamp` **and** `v2b-fix`) |
-| `--mem-fs-inject` | `none` | `none`/`te`/`moment` | v2b: inject per-frame memory state into the framesamp tokens (`moment` = the v2b-fix recipe; `te` = ordering-only ablation) |
+| `--mem-framesamp-frames` | `8` | int | episode-spanning frames the loader appends (**required >0** for `framesamp` **and** Multi-resolution memory) |
+| `--mem-fs-inject` | `none` | `none`/`te`/`moment` | fuse the read-out state into each frame's image tokens (`moment` = the Multi-resolution recipe; `te` = ordering-only ablation; `none` = unfused two-channel) |
 | `--mem-framesamp-budget` | `512` | int | cap on raw vision tokens fed to FiLM/spatial-attn |
 | `--mem-fs-select` | `fifo` | `fifo`/`diff`/`patch_union` | **which** frames/patches enter memory (`framesamp` only); stamped into the ckpt so eval matches training |
 | `--mem-fs-diff-stride` | `8` | int | scoring cadence for `diff`/`patch_union` (env steps at train, **policy calls** at eval — if the server is hit once per action chunk the effective stride is 8×chunk) |
@@ -177,7 +179,7 @@ Variations (read-out only): wide bank `--n-moment-tokens 128`; aggregator swap `
 integration `--mem-cond-type adaln` or `--mem-cond-type modul` instead of cross_attn (cross_attn is best).
 
 **Optional two stages (HAMLET only).** The read-out tokens can be warm-started by TCL (time-contrastive)
-pretraining before the finetune above — FrameSamp and v2b-fix have no TCL stage.
+pretraining before the finetune above — FrameSamp and Multi-resolution memory have no TCL stage.
 
 > **Note — recommended: skip Stage 1.** Just train Method 1 directly from **random** moment-token init (the
 > command above). Per the proposal, the read-out summarizes the history nearly identically regardless of
@@ -207,7 +209,7 @@ torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune
 ```
 FrameSamp is integrated via `modul` (FiLM); `--mem-film-layers all|mid|8-20` picks the injection depth.
 
-### Method 3 — v2b-fix (read-out + raw, hybrid with state-injected frames)
+### Method 3 — Multi-resolution memory (read-out fused into framesamp image tokens)
 
 ```bash
 torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune.py \
@@ -215,12 +217,13 @@ torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune
   --modality-config-path gr00t/configs/data/robomme_config.py --num-gpus 4 --global-batch-size 32 \
   --hamlet-mode finetune --learning-rate 1e-4 --max-grad-norm 1.0 --tune-top-llm-layers 4 \
   --memory-window 4 --memory-stride 16 --memory-num-layers 2 --memory-type moment_token --no-freeze-moment-tokens \
-  --max-steps 60000 --save-steps 10000 --save-total-limit 10 --output-dir runs/robomme/v2b_fix \
+  --max-steps 60000 --save-steps 10000 --save-total-limit 10 --output-dir runs/robomme/multires \
   --n-moment-tokens 4 --mem-cond-type dual --mem-fs-inject moment --mem-framesamp-frames 8
 ```
-`v2b-fix` carries its own integration (h_sem KV-tail + h_spatial spatial-cross-attn); `--mem-framesamp-frames > 0`
-is **required** or it degenerates to the read-out baseline. **`--mem-fs-inject moment` is what makes it v2b-fix** —
-without it you get the plain hybrid (9.1 %), which is *worse than either single channel*.
+Multi-resolution memory carries its own integration (h_sem KV-tail + h_spatial spatial-cross-attn);
+`--mem-framesamp-frames > 0` is **required** or it degenerates to the read-out baseline.
+**`--mem-fs-inject moment` is the fusion** — without it you get the unfused two-channel variant (9.1 %),
+which is *worse than either single channel*.
 
 ### Method 4 — TokenDrop (**selection method 2/3** — diff keyframes)  *(= `run_scripts/train_tokendrop_n1d6.sh`)*
 
@@ -280,7 +283,7 @@ aborts on mismatch. (There is **no** `--control-mode` flag in this repo.)
 
 ## 5. Results so far (RoboMME success-rate, %)
 
-From the proposal — the empirical motivation for the new methods:
+### 5a. Multi-resolution memory, fuse read-out token into image token (select by framesamp) 
 
 | memory | Counting (temporal) | Permanence (spatial) | Reference (object) | Imitation (procedural) | **Overall** |
 |---|--:|--:|--:|--:|--:|
@@ -288,14 +291,25 @@ From the proposal — the empirical motivation for the new methods:
 | read-out n_q=4 (HAMLET) | 24.5 | 17.0 | 21.5 | 10.5 | **18.4** |
 | read-out n_q=128 | 29.5 | 15.0 | 17.0 | 13.0 | **18.6** |
 | raw image tokens (FrameSamp) | 8.5 | 11.0 | 14.5 | **15.5** | 12.4 |
+| **Multi-resolution memory** @60k | 7.0 | **17.5** | 14.5 | 5.5 | **11.1** |
+| ├ @50k | 6.0 | 14.5 | 12.5 | 7.5 | 10.1 |
+| └ @40k | 2.0 | 6.0 | 7.0 | 6.0 | 5.2 |
+| *(ablation)* no fusion — two parallel channels | 7.0 | 11.0 | 13.0 | 5.5 | 9.1 |
+| *(ref)* mamba aggregator @40k ⚠️undertrained | 17.0 | 10.5 | 13.0 | 5.5 | 11.5 |
 
-*Read-out wins the aggregate suites; raw tokens win Imitation — the low-pass ceiling.* **Hybrid arms that target that ceiling:**
-`v2b-fix` (@60k **11.1 %** — Counting 7.0 / Permanence 17.5 / Reference 14.5 / Imitation 5.5; ramps
-5.2 → 10.1 → 11.1 over 40k/50k/60k) and `mamba` (selective-SSM aggregator, `cross_attn`, K=16 linspace,
-@40k 11.5 %). v2b-fix beats the plain hybrid (9.1) and wins **Permanence** outright (17.5 > framesamp 11.0,
-moment 17.0) but stays under framesamp 12.4 / moment 18.4 overall — the state-injection fixes frame
-aliasing, not the two channels' gradient competition. (n_q=4 K=16-linspace is **not** directly comparable
-to the K=4-recent 18.4.)
+*Read-out wins the aggregate suites; raw tokens win Imitation — the low-pass ceiling.*
+
+**Multi-resolution memory** (`--mem-cond-type dual --mem-fs-inject moment`) targets that ceiling by
+**fusing the two resolutions instead of running them side by side**: each framesamp frame's raw image
+tokens are *colored* by that frame's own read-out state (block-causal, zero-init projection), so the
+low-res summary and the high-res detail arrive **bound together** rather than as two channels the DiT must
+reconcile. Verdict at 60k: **11.1 %** — it wins **Permanence outright (17.5**, above FrameSamp 11.0 and
+read-out 17.0) and beats the unfused two-channel ablation (9.1, which is *worse than either channel alone* —
+the classic gradient-competition failure), but it stays under FrameSamp 12.4 / read-out 18.4 overall.
+Reading: the fusion fixes **frame aliasing** (episode-spanning frames were previously indistinguishable to
+the policy), not the deeper problem that the two channels still compete for the same gradient budget. It
+also trains slowly — 5.2 → 10.1 → 11.1 across 40k/50k/60k, i.e. still climbing at the end of the run.
+(n_q=4 K=16-linspace `mamba` is **not** directly comparable to the K=4-recent 18.4.)
 
 ### 5b. Keyframe-selection A/B (2026-07-21, all @60k, 16 tasks × 50 eps = 800 episodes each)
 
@@ -336,17 +350,17 @@ drift) rather than an either/or.
 
 ## 6. Caveats / gotchas
 
-- **`v2b-fix` and `framesamp` require `--mem-framesamp-frames > 0`.** The loader only appends the
+- **Multi-resolution memory and `framesamp` require `--mem-framesamp-frames > 0`.** The loader only appends the
   episode-spanning frames when `mem_source=framesamp` **or** `mem_cond_type=dual`; omit it and the hybrid
   silently degenerates to the moment-only `cross_attn` baseline (its `h_spatial` channel has nothing to read).
 - **`--mem-fs-inject` was silently dropped once** (the `setup.py` allowlist bug, §"Checkpoint config stamping"):
-  a run labelled v2b actually trained as the plain hybrid. **Verify after launch**: the ckpt config must show
+  a run labelled multi-resolution actually trained as the unfused two-channel variant. **Verify after launch**: the ckpt config must show
   `mem_fs_inject=moment` **and** the weights must contain `fs_inject` tensors (21 of them).
 - **Flag scoping:** `mem_source`/`mem_film_layers` are `modul`-only; `mem_image_side` is `cross_attn`-only;
   `mem_window_mode` is `mem_source=moment`-only. Keep `framesamp` on `--mem-cond-type modul` (or use it as
   the hybrid's `h_spatial`).
 - **`run_scripts/train_hamlet_n1d6.sh` only wires the basic HAMLET flags.** To train `gru/ssm/mamba`,
-  `framesamp`, `v2b-fix`, or `linspace` you must **append** `--memory-arch/--mem-source/--mem-framesamp-*/`
+  `framesamp`, multi-resolution, or `linspace` you must **append** `--memory-arch/--mem-source/--mem-framesamp-*/`
   `--mem-window-mode/...` to the Stage-2 torchrun — otherwise the defaults (`transformer`/`moment`/`recent`) apply.
 - **SequenceMemory NaN (fixed).** The `gru/ssm/mamba` residual stream was observed to spike to ~10³¹ and NaN
   in bf16. The fix is baked into `seq_memory.py`: **bias-free Linears** (matching `MemoryTransformer`),
