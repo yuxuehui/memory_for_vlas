@@ -22,12 +22,10 @@ codebase** — a method is a combination of config flags, not a branch.
 | **HAMLET（压缩记忆）** | `--hamlet-mode finetune --mem-source moment` | `modules/memory.py`（`MemoryTransformer`）· `seq_memory.py`（GRU/SSM/Mamba 变体）· `multiscale_memory.py` |
 | **framesamp（均匀关键帧）** | `--mem-source framesamp --mem-fs-select fifo` | `gr00t_n1d6.py::_framesamp_mem_seq` + loader linspace |
 | **tokendrop（diff 关键帧）** | `--mem-source framesamp --mem-fs-select diff` | `modules/fs_diff_select.py` + loader `_fs_diff_scores` / `_fs_diff_indices` |
-| **patch_union（patch 级并集）** | `--mem-source framesamp --mem-fs-select patch_union` | `modules/fs_patch_union.py` + `gr00t_n1d6.py::_patch_union_mem_seq` / `_patch_union_score_pass` / `_pu_commit` |
+| **Action-conditioned patch memory（patch_union）** | `--mem-source framesamp --mem-fs-select patch_union` | `modules/fs_patch_union.py` + `gr00t_n1d6.py::_patch_union_mem_seq` / `_patch_union_score_pass` / `_pu_commit` |
 
 `--mem-fs-select` 只在 `--mem-source framesamp` 下生效，它决定 **哪些帧/patch 进入 memory**（选择规则），
-与 `--mem-cond-type`（记忆怎么注入 DiT）正交。**选择规则必须训练和推理两侧一致** —— 见
-[§6 caveats](#6-caveats--gotchas) 的 trained-in 教训。
-
+与 `--mem-cond-type`（记忆怎么注入 DiT）正交。
 ---
 
 ## 1. The idea (from the proposal)
@@ -49,13 +47,15 @@ the ceiling is the **pooling operation**, not the token count.
 
 **Two routes out of the low-pass ceiling** (and how this repo explores them):
 1. **Un-pool → keep raw per-position tokens** (`A=I`): the **FrameSamp** path (family ①), and the
-   **`h_spatial`** channel of **`dual`**.
+   **`h_spatial`** channel of **`v2b-fix`**.
 2. **Replace attention-pooling with a non-low-pass aggregator**: the **`SequenceMemory`** recurrent/SSM
    memories (`--memory-arch gru|ssm|mamba`) — a learned *selective* running state instead of a softmax
    average (e.g. count-/event-tracking), rather than a DC summary.
 
-`dual` is the **hybrid** that keeps the read-out's useful low-pass summary **and** its register effect
-(freeing the action query from image-background patches) **while** adding raw spatial detail back.
+**`v2b-fix`** is the **hybrid** that keeps the read-out's useful low-pass summary **and** its register effect
+(freeing the action query from image-background patches) **while** adding raw spatial detail back — and it
+fixes the plain-hybrid's aliasing problem by **injecting each frame's memory state into its own framesamp
+tokens** (`--mem-fs-inject moment`), so episode-spanning frames stop being indistinguishable.
 
 ---
 
@@ -72,17 +72,29 @@ into the action head*). The two axes are **orthogonal** — any memory pairs wit
 |---|---|---|---|---|
 | **Read-out (HAMLET)** | ② read-out summary | K past sets of `n_q` learnable moment tokens, compressed by the aggregator → a low-pass (DC) summary of the history | `--n-moment-tokens <n_q>` | ✅ main recipe (~18.4) |
 | **FrameSamp (raw tokens)** | ① raw tokens | F episode-spanning frames' **raw vision patch tokens** (≤ budget) — uncompressed spatial/temporal detail | `--mem-source framesamp --mem-framesamp-frames 8 --mem-framesamp-budget 512` | ✅ |
-| **dual (hybrid)** | ①+② the proposed fix | **both at once**: read-out (`h_sem`) **+** raw framesamp (`h_spatial`, a new zero-init per-block spatial cross-attn) — targets the low-pass ceiling | `--mem-cond-type dual --mem-framesamp-frames 8` | ✅ (DONE: @60k 9.1 %, @80k 8.75 % — capped; see `8_method_hybrid.md`) |
+| **v2b-fix (hybrid)** | ①+② the proposed fix | **both at once**: read-out (`h_sem`) **+** raw framesamp (`h_spatial`, zero-init per-block spatial cross-attn), with each frame's tokens **colored by its own memory state** (block-causal, zero-init proj) so repeated frames are no longer aliased | `--mem-cond-type dual --mem-fs-inject moment --mem-framesamp-frames 8` | ✅ (DONE: @60k **11.1 %**; see `../Markdown/16_memory_into_image_tokens.md`) |
 
-**Keyframe *selection* (a sub-axis of `framesamp`).** `framesamp` fixes *how many* frames enter memory
-(`--mem-framesamp-frames`); `--mem-fs-select` fixes *which ones*. Both train- and inference-side use the
-**same rule** (this matters — see caveats):
+### (1b) Keyframe selection — *which frames/patches enter the fixed budget*
 
-| Selection | What it keeps | Train side | Inference side | Flags | Status |
-|---|---|---|---|---|---|
-| **fifo** (default) | acausal whole-episode `linspace` frames at train; recent-F FIFO at eval — **the two do not match** | loader `linspace(0, T-1, F)` | rolling FIFO of the F most recent frames | `--mem-fs-select fifo` | ✅ 12.4 % |
-| **diff** (TokenDrop) | frame-0 sentinel + top-(F−2) **pixel-difference** peaks ≤ anchor + current frame — causal both sides | `_fs_diff_scores` / `_fs_diff_indices` (memoized per episode) | `DiffFrameSelector` (incremental heap) | `--mem-fs-select diff [--mem-fs-diff-stride 8]` | ✅ 14.0 % |
-| **patch_union** | **individual patch tokens**, not frames: novelty top-(αM) ∪ action-attention top-((1−α)M) | `_patch_union_mem_seq` + two-pass `_patch_union_score_pass` (no_grad, captures DiT L13 action→patch attn over all candidates) | read heap → capture attn in the real forward → `_pu_commit` post-action write | `--mem-fs-select patch_union [--mem-fs-attn-layer 13 --mem-fs-diff-share 0.5]` | ⏳ training (see `../Markdown/21_patch_union_memory.md`) |
+`--mem-source framesamp` fixes **how much** memory there is (`--mem-framesamp-frames` frames,
+`--mem-framesamp-budget` tokens); **`--mem-fs-select` decides what fills it.** Three methods, increasingly
+informed — from content-blind uniform sampling, to observation-driven change detection, to
+action-conditioned relevance. The rule is applied **identically at train and inference** (except `fifo`,
+which is historically mismatched — see caveats):
+
+| # | Selection method | Selection signal | Unit | Train side | Inference side | Flags | Result |
+|---|---|---|---|---|---|---|---|
+| 1 | **FrameSamp** (uniform) | none — content-blind even coverage | frame | loader `linspace(0, T-1, F)` (acausal) | rolling FIFO of the F most recent frames ⚠️ **mismatched** | `--mem-fs-select fifo` (default) | ✅ **12.4 %** |
+| 2 | **TokenDrop** (diff) | **observation change**: mean \|pixel diff\| vs the last scored frame (frame-0 sentinel + top-(F−2) peaks ≤ anchor) | frame | `_fs_diff_scores` / `_fs_diff_indices` (causal, memoized per episode) | `DiffFrameSelector` (incremental heap) | `--mem-fs-select diff [--mem-fs-diff-stride 8]` | ✅ **14.0 %** |
+| 3 | **Action-conditioned patch memory** (patch_union) | **novelty ∪ action-relevance**: token-space Δ top-(αM) **∪** DiT action→patch cross-attention top-((1−α)M) | **patch** | `_patch_union_mem_seq` + two-pass `_patch_union_score_pass` (no_grad pass over *all* candidates captures layer-ℓ attention) | read heap → capture attn in the real forward → `_pu_commit` post-action write | `--mem-fs-select patch_union [--mem-fs-attn-layer 13 --mem-fs-diff-share 0.5]` | ⏳ training |
+
+- **1 → 2** trades uniform coverage for event coverage: wins the event-sparse suites (Counting +11.0,
+  Permanence +8.5) and loses the continuous-trajectory ones (Reference −6.5, Imitation −6.5). Uniform
+  sampling turns out to be the *correct prior for continuous manner*, not a naive baseline (§5b).
+- **2 → 3** drops the selection unit from frames to **patches** and adds a second, *task-conditioned*
+  channel: the policy's own action queries vote on which patches matter. At the same 512-token budget a
+  patch-level union spans ~120 timesteps instead of 8 frames. Design + probe evidence:
+  [`../Markdown/21_patch_union_memory.md`](../Markdown/21_patch_union_memory.md).
 
 - **Read-out size** — set by `--n-moment-tokens` (`n_q`): **4** (light; the ~18.4 baseline) or **128** (wide
   bank; tests token-count vs the pooling ceiling — scaling 32× barely helps, so the limit is the *pooling op*).
@@ -90,9 +102,9 @@ into the action head*). The two axes are **orthogonal** — any memory pairs wit
   (default, block-causal attention) · `gru` · `ssm` (S4D) · `mamba` (selective SSM). The recurrent/SSM
   variants replace softmax-pooling with a learned running state (count/event tracking — a *non*-low-pass
   alternative). `mamba` (`exp_mamba/mamba_b`, K=16, hidden 512, state 64): **@40k = 11.5 %** — above vanilla
-  8.25 / dual 9.1, but below framesamp 12.4 and the moment bar 18.38 on *every* suite (Counting 17.0/24.5,
+  8.25 / v2b-fix 11.1, but below framesamp 12.4 and the moment bar 18.38 on *every* suite (Counting 17.0/24.5,
   Permanence 10.5/17.0, Reference 13.0/21.5, Imitation 5.5/10.5; best tasks SwingXtimes 32, VideoPlaceOrder 18).
-  ⚠️ run cut at **40k of 60k** (VM deleted) — undertrained confound LIVE (cf. dual jumped +6.4 at 40k→50k);
+  ⚠️ run cut at **40k of 60k** (VM deleted) — undertrained confound LIVE (cf. v2b-fix jumped +4.9 at 40k→50k);
   ckpts 10k–40k in `gs://…/exp_mamba/mamba_b/`, eval CSVs `/tmp/robomme_eval/out_mamba_40k/`.
 - **History coverage** — `--mem-window-mode recent` (recent K-stride window, default) vs `linspace` (causal
   whole-episode coverage). Orthogonal to everything above.
@@ -116,7 +128,7 @@ Everything is a flag on `gr00t/experiment/launch_finetune.py` (`gr00t/configs/fi
 | Flag | Default | Choices | Meaning |
 |---|---|---|---|
 | `--hamlet-mode` | `finetune` | `off` / `tcl` / `finetune` | stage gate: vanilla / Stage-1 TCL pretrain / Stage-2 memory+head |
-| `--mem-cond-type` | `cross_attn` | `cross_attn` / `adaln` / `modul` / `dual` | **how** memory conditions the DiT |
+| `--mem-cond-type` | `cross_attn` | `cross_attn` / `adaln` / `modul` / `dual` | **how** memory conditions the DiT (`dual` = the v2b-fix hybrid's two-channel wiring) |
 | `--memory-arch` | `transformer` | `transformer` / `gru` / `ssm` / `mamba` | **aggregator** over the K·n_q history |
 | `--mem-source` | `moment` | `moment` / `framesamp` | compressed moment tokens vs raw per-frame patches (`modul` only) |
 | `--mem-window-mode` | `recent` | `recent` / `linspace` | recent K-stride window vs causal whole-episode coverage (`moment` only) |
@@ -127,7 +139,8 @@ Everything is a flag on `gr00t/experiment/launch_finetune.py` (`gr00t/configs/fi
 | `--memory-num-layers` | `2` | int | aggregator depth |
 | `--memory-hidden` | `512` | int | SequenceMemory bottleneck (`gru/ssm/mamba`) |
 | `--memory-state-dim` | `64` | int | SSM state size (`ssm/mamba`) |
-| `--mem-framesamp-frames` | `8` | int | episode-spanning frames the loader appends (**required >0** for `framesamp` **and** `dual`) |
+| `--mem-framesamp-frames` | `8` | int | episode-spanning frames the loader appends (**required >0** for `framesamp` **and** `v2b-fix`) |
+| `--mem-fs-inject` | `none` | `none`/`te`/`moment` | v2b: inject per-frame memory state into the framesamp tokens (`moment` = the v2b-fix recipe; `te` = ordering-only ablation) |
 | `--mem-framesamp-budget` | `512` | int | cap on raw vision tokens fed to FiLM/spatial-attn |
 | `--mem-fs-select` | `fifo` | `fifo`/`diff`/`patch_union` | **which** frames/patches enter memory (`framesamp` only); stamped into the ckpt so eval matches training |
 | `--mem-fs-diff-stride` | `8` | int | scoring cadence for `diff`/`patch_union` (env steps at train, **policy calls** at eval — if the server is hit once per action chunk the effective stride is 8×chunk) |
@@ -164,7 +177,7 @@ Variations (read-out only): wide bank `--n-moment-tokens 128`; aggregator swap `
 integration `--mem-cond-type adaln` or `--mem-cond-type modul` instead of cross_attn (cross_attn is best).
 
 **Optional two stages (HAMLET only).** The read-out tokens can be warm-started by TCL (time-contrastive)
-pretraining before the finetune above — FrameSamp and dual have no TCL stage.
+pretraining before the finetune above — FrameSamp and v2b-fix have no TCL stage.
 
 > **Note — recommended: skip Stage 1.** Just train Method 1 directly from **random** moment-token init (the
 > command above). Per the proposal, the read-out summarizes the history nearly identically regardless of
@@ -181,7 +194,7 @@ torchrun --nproc_per_node=4 gr00t/experiment/launch_finetune.py ... \
 --load-moment-tokens-from runs/robomme/tcl_stage1/checkpoint-20000 [--freeze-moment-tokens]
 ```
 
-### Method 2 — FrameSamp (raw tokens)
+### Method 2 — FrameSamp (raw tokens; **selection method 1/3** — uniform)
 
 ```bash
 torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune.py \
@@ -194,7 +207,7 @@ torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune
 ```
 FrameSamp is integrated via `modul` (FiLM); `--mem-film-layers all|mid|8-20` picks the injection depth.
 
-### Method 3 — dual (read-out + raw, hybrid)
+### Method 3 — v2b-fix (read-out + raw, hybrid with state-injected frames)
 
 ```bash
 torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune.py \
@@ -202,13 +215,14 @@ torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune
   --modality-config-path gr00t/configs/data/robomme_config.py --num-gpus 4 --global-batch-size 32 \
   --hamlet-mode finetune --learning-rate 1e-4 --max-grad-norm 1.0 --tune-top-llm-layers 4 \
   --memory-window 4 --memory-stride 16 --memory-num-layers 2 --memory-type moment_token --no-freeze-moment-tokens \
-  --max-steps 60000 --save-steps 10000 --save-total-limit 10 --output-dir runs/robomme/dual \
-  --n-moment-tokens 4 --mem-cond-type dual --mem-framesamp-frames 8
+  --max-steps 60000 --save-steps 10000 --save-total-limit 10 --output-dir runs/robomme/v2b_fix \
+  --n-moment-tokens 4 --mem-cond-type dual --mem-fs-inject moment --mem-framesamp-frames 8
 ```
-`dual` carries its own integration (h_sem KV-tail + h_spatial spatial-cross-attn); `--mem-framesamp-frames > 0`
-is **required** or it degenerates to the read-out baseline.
+`v2b-fix` carries its own integration (h_sem KV-tail + h_spatial spatial-cross-attn); `--mem-framesamp-frames > 0`
+is **required** or it degenerates to the read-out baseline. **`--mem-fs-inject moment` is what makes it v2b-fix** —
+without it you get the plain hybrid (9.1 %), which is *worse than either single channel*.
 
-### Method 4 — tokendrop (diff keyframes)  *(= `run_scripts/train_tokendrop_n1d6.sh`)*
+### Method 4 — TokenDrop (**selection method 2/3** — diff keyframes)  *(= `run_scripts/train_tokendrop_n1d6.sh`)*
 
 Same as FrameSamp **except** the selection rule — causal pixel-difference keyframes on **both** sides.
 Trained via `cross_attn` here (1:1 with the exp-d framesamp baseline, so the A/B isolates selection only):
@@ -227,7 +241,7 @@ torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune
 Eval needs no extra flag (`mem_fs_select` is in the ckpt config); to override on an *old* ckpt:
 `run_gr00t_server.py --mem-fs-select diff`.
 
-### Method 5 — patch_union (patch-level novelty ∪ action-relevance)
+### Method 5 — Action-conditioned patch memory (**selection method 3/3** — patch_union)
 
 Selection drops from **frames** to **individual patch tokens**. Keep `--mem-framesamp-frames 8`: the
 backbone processes K+F frames, and F=16 **OOMs** on 80 GB (see caveats).
@@ -275,16 +289,20 @@ From the proposal — the empirical motivation for the new methods:
 | read-out n_q=128 | 29.5 | 15.0 | 17.0 | 13.0 | **18.6** |
 | raw image tokens (FrameSamp) | 8.5 | 11.0 | 14.5 | **15.5** | 12.4 |
 
-*Read-out wins the aggregate suites; raw tokens win Imitation — the low-pass ceiling.* **In progress:**
-`dual` (hybrid) and `mamba` (selective-SSM aggregator, `cross_attn`, K=16 linspace, from base) — the two
-arms that target that ceiling. (n_q=4 K=16-linspace is **not** directly comparable to the K=4-recent 18.4.)
+*Read-out wins the aggregate suites; raw tokens win Imitation — the low-pass ceiling.* **Hybrid arms that target that ceiling:**
+`v2b-fix` (@60k **11.1 %** — Counting 7.0 / Permanence 17.5 / Reference 14.5 / Imitation 5.5; ramps
+5.2 → 10.1 → 11.1 over 40k/50k/60k) and `mamba` (selective-SSM aggregator, `cross_attn`, K=16 linspace,
+@40k 11.5 %). v2b-fix beats the plain hybrid (9.1) and wins **Permanence** outright (17.5 > framesamp 11.0,
+moment 17.0) but stays under framesamp 12.4 / moment 18.4 overall — the state-injection fixes frame
+aliasing, not the two channels' gradient competition. (n_q=4 K=16-linspace is **not** directly comparable
+to the K=4-recent 18.4.)
 
 ### 5b. Keyframe-selection A/B (2026-07-21, all @60k, 16 tasks × 50 eps = 800 episodes each)
 
 Measured on the *same* pipeline; the three memory arms share K=8 / budget 512 / `cross_attn`, so
 framesamp↔tokendrop isolates **selection only**. (vanilla = K=4 no-memory control.)
 
-| suite | vanilla | HAMLET (K=8) | framesamp `fifo` | tokendrop `diff` |
+| suite | vanilla | HAMLET (K=8) | FrameSamp (uniform) | TokenDrop (diff) |
 |---|--:|--:|--:|--:|
 | Counting | 13.0 | **25.5** | 8.5 | 19.5 |
 | Permanence | 5.0 | 18.0 | 11.0 | **19.5** |
@@ -318,14 +336,17 @@ drift) rather than an either/or.
 
 ## 6. Caveats / gotchas
 
-- **`dual` and `framesamp` require `--mem-framesamp-frames > 0`.** The loader only appends the episode-spanning
-  frames when `mem_source=framesamp` **or** `mem_cond_type=dual`; omit it and `dual` silently degenerates to
-  the moment-only `cross_attn` baseline (its `h_spatial` channel has nothing to read).
+- **`v2b-fix` and `framesamp` require `--mem-framesamp-frames > 0`.** The loader only appends the
+  episode-spanning frames when `mem_source=framesamp` **or** `mem_cond_type=dual`; omit it and the hybrid
+  silently degenerates to the moment-only `cross_attn` baseline (its `h_spatial` channel has nothing to read).
+- **`--mem-fs-inject` was silently dropped once** (the `setup.py` allowlist bug, §"Checkpoint config stamping"):
+  a run labelled v2b actually trained as the plain hybrid. **Verify after launch**: the ckpt config must show
+  `mem_fs_inject=moment` **and** the weights must contain `fs_inject` tensors (21 of them).
 - **Flag scoping:** `mem_source`/`mem_film_layers` are `modul`-only; `mem_image_side` is `cross_attn`-only;
   `mem_window_mode` is `mem_source=moment`-only. Keep `framesamp` on `--mem-cond-type modul` (or use it as
-  `dual`'s `h_spatial`).
+  the hybrid's `h_spatial`).
 - **`run_scripts/train_hamlet_n1d6.sh` only wires the basic HAMLET flags.** To train `gru/ssm/mamba`,
-  `framesamp`, `dual`, or `linspace` you must **append** `--memory-arch/--mem-source/--mem-framesamp-*/`
+  `framesamp`, `v2b-fix`, or `linspace` you must **append** `--memory-arch/--mem-source/--mem-framesamp-*/`
   `--mem-window-mode/...` to the Stage-2 torchrun — otherwise the defaults (`transformer`/`moment`/`recent`) apply.
 - **SequenceMemory NaN (fixed).** The `gru/ssm/mamba` residual stream was observed to spike to ~10³¹ and NaN
   in bf16. The fix is baked into `seq_memory.py`: **bias-free Linears** (matching `MemoryTransformer`),
