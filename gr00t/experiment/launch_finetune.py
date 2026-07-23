@@ -130,6 +130,8 @@ if __name__ == "__main__":
     config.model.mem_fs_diff_stride = ft_config.mem_fs_diff_stride
     config.model.mem_fs_attn_layer = ft_config.mem_fs_attn_layer
     config.model.mem_fs_diff_share = ft_config.mem_fs_diff_share
+    config.model.mem_fs_tail_share = ft_config.mem_fs_tail_share
+    config.model.mem_fs_pos_rope = ft_config.mem_fs_pos_rope
     config.model.mem_image_side = ft_config.mem_image_side
     config.model.mem_window_mode = ft_config.mem_window_mode
     if (

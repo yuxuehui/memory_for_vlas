@@ -31,6 +31,19 @@ import torch.nn.functional as F
 # call-count mod n_cross == layer. Inactive (zero overhead) outside the scoring pass.
 _CAP = {"scores": None, "count": 0, "layer": 13, "n_cross": 16, "active": False}
 _PATCHED = False
+# PPE-style key RoPE (note-23): when active, rotate the LAST `rope_M` keys of every cross-attn
+# (Lq != Lk) by cos/sin, so the memory patches' (Δt,y,x) enter the QK dot product. Applied
+# BEFORE the act-capture scoring so both the capture and the real sdpa see rotated keys.
+_ROPE = {"cos": None, "sin": None, "M": 0, "active": False}
+
+
+def set_rope(cos, sin, M: int) -> None:
+    _ROPE["cos"], _ROPE["sin"], _ROPE["M"], _ROPE["active"] = cos, sin, int(M), True
+
+
+def clear_rope() -> None:
+    _ROPE["cos"] = _ROPE["sin"] = None
+    _ROPE["M"], _ROPE["active"] = 0, False
 
 
 def install_capture(layer: int, n_cross: int) -> None:
@@ -41,6 +54,17 @@ def install_capture(layer: int, n_cross: int) -> None:
     orig = F.scaled_dot_product_attention
 
     def patched(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kw):
+        # PPE key RoPE: rotate the last M keys of a cross-attn (queries left at identity).
+        if _ROPE["active"] and _ROPE["cos"] is not None and q.shape[-2] != k.shape[-2]:
+            try:
+                from gr00t.model.modules.fs_pos_rope import rotate_keys
+                M = _ROPE["M"]
+                if 0 < M <= k.shape[-2] and _ROPE["cos"].shape[-2] == M:
+                    kk = k.clone()
+                    kk[..., -M:, :] = rotate_keys(k[..., -M:, :], _ROPE["cos"], _ROPE["sin"])
+                    k = kk
+            except Exception:
+                pass
         out = orig(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
                    is_causal=is_causal, scale=scale, **kw)
         if _CAP["active"]:
@@ -109,18 +133,23 @@ def pix_cells(pix_flat: torch.Tensor, n_img: int) -> torch.Tensor | None:
 
 
 class PatchUnionSelector:
-    """Per-session running patch memory: diff top-(budget*share) UNION attn top-(rest)."""
+    """Per-session running patch memory: novelty top-(budget*diff_share) UNION act-relevance
+    UNION (optional) tail_L15, the non-novelty budget split by `tail_share`."""
 
-    def __init__(self, budget: int = 512, diff_share: float = 0.5, stride: int = 1):
+    def __init__(self, budget: int = 512, diff_share: float = 0.5, stride: int = 1,
+                 tail_share: float = 0.0):
         self.budget = int(budget)
         self.n_diff = max(1, int(round(budget * diff_share)))
-        self.n_attn = max(0, self.budget - self.n_diff)
+        rem = max(0, self.budget - self.n_diff)
+        self.n_tail = max(0, int(round(rem * tail_share)))
+        self.n_attn = max(0, rem - self.n_tail)
         self.stride = max(1, int(stride))
         self.reset()
 
     def reset(self):
         self.diff_heap: list = []   # (score, step, idx, token)
         self.attn_heap: list = []
+        self.tail_heap: list = []
         self.last_cells: torch.Tensor | None = None
         self.step = -1
 
@@ -132,10 +161,11 @@ class PatchUnionSelector:
             heapq.heappop(heap)
 
     def observe(self, vis: torch.Tensor, cells: torch.Tensor | None,
-                attn: torch.Tensor | None) -> None:
+                attn: torch.Tensor | None, tail: torch.Tensor | None = None) -> None:
         """vis: (n_img, d) current-frame raw image tokens; cells: (n_img,) pixel cell
         intensities (diff signal; falls back to token-space); attn: (n_img,) captured
-        cross-attn scores for the current frame (None on the first call)."""
+        cross-attn scores; tail: (n_img,) patch . frame-summary dot product (tail_L15
+        channel). attn/tail are None on the first call."""
         self.step += 1
         n_img = vis.shape[0]
         sig = cells if cells is not None else vis.detach().float().mean(-1)
@@ -155,21 +185,42 @@ class PatchUnionSelector:
         if attn is not None and self.n_attn > 0:
             for i in range(n_img):
                 self._push(self.attn_heap, self.n_attn, (float(attn[i]), self.step, i, vis[i].detach()))
+        if tail is not None and self.n_tail > 0:
+            for i in range(n_img):
+                self._push(self.tail_heap, self.n_tail, (float(tail[i]), self.step, i, vis[i].detach()))
 
-    def read(self, vis_current: torch.Tensor) -> torch.Tensor:
-        """(budget, d): union of both heaps in (step, idx) order, deduped, padded with
-        current-frame tokens to exactly budget rows."""
+    def read(self, vis_current: torch.Tensor, want_pos: bool = False, n_views: int = 2):
+        """(budget, d): union of all heaps in (step, idx) order, deduped, padded with
+        current-frame tokens to exactly budget rows. If want_pos, also return (budget, 3)
+        (Δt, y, x) for PPE key RoPE: Δt = current_step - entry_step (recency), y (wrist folded
+        +side), x — matching fs_pos_rope.positions_from_flat's scheme."""
         seen, entries = set(), []
-        for heap in (self.diff_heap, self.attn_heap):
+        for heap in (self.diff_heap, self.attn_heap, self.tail_heap):
             for (s, t, i, tok) in heap:
                 if (t, i) not in seen:
                     seen.add((t, i))
                     entries.append((t, i, tok))
         entries.sort(key=lambda e: (e[0], e[1]))
         dev = vis_current.device
-        toks = [tok.to(dev) for (_t, _i, tok) in entries][: self.budget]
+        kept = entries[: self.budget]
+        toks = [tok.to(dev) for (_t, _i, tok) in kept]
+        n_img = vis_current.shape[0]
+        pos = None
+        if want_pos:
+            per_view = max(1, n_img // n_views)
+            side = int(round(per_view ** 0.5))
+            pos = []
+            for (t, i, _tok) in kept:
+                view = min(i // per_view, n_views - 1)
+                within = i % per_view
+                pos.append([self.step - t, within // side + view * side, within % side])
         k = 0
         while len(toks) < self.budget:
-            toks.append(vis_current[k % vis_current.shape[0]])
+            toks.append(vis_current[k % n_img])
+            if want_pos:
+                pos.append([0, 0, 0])           # current-frame padding at Δt=0
             k += 1
-        return torch.stack(toks, dim=0)
+        out = torch.stack(toks, dim=0)
+        if want_pos:
+            return out, torch.tensor(pos, dtype=torch.float32, device=dev)
+        return out

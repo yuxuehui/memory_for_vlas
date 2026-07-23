@@ -87,7 +87,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 "memory_window", "memory_num_layers", "memory_stride", "mem_cond_type",
                 "mem_fs_inject", "mem_film_layers", "mem_source", "mem_framesamp_budget",
                 "mem_framesamp_frames", "mem_fs_select", "mem_fs_diff_stride",
-                "mem_fs_attn_layer", "mem_fs_diff_share",
+                "mem_fs_attn_layer", "mem_fs_diff_share", "mem_fs_tail_share", "mem_fs_pos_rope",
                 "mem_image_side", "freeze_moment_tokens",
                 "memory_type", "tcl_tau", "tcl_no_projection_head", "mem_window_mode",
                 "memory_arch", "memory_hidden", "memory_state_dim",

@@ -92,6 +92,10 @@ class Gr00tN1d6ActionHead(nn.Module):
         # budget = diff top-(share) UNION action->image cross-attn top-(rest) at this layer.
         self.mem_fs_attn_layer = int(getattr(config, "mem_fs_attn_layer", 13))
         self.mem_fs_diff_share = float(getattr(config, "mem_fs_diff_share", 0.5))
+        self.mem_fs_tail_share = float(getattr(config, "mem_fs_tail_share", 0.0))
+        self.mem_fs_pos_rope = bool(getattr(config, "mem_fs_pos_rope", False))
+        self._pu_rope_hd = int(config.diffusion_model_cfg.get("attention_head_dim", 48))
+        self._pu_positions = None  # (B, M, 3) Δt,y,x of the current mem_seq, for key RoPE
         # Per-session selector list at inference (DiffFrameSelector | PatchUnionSelector);
         # Gr00tPolicy round-trips it across calls exactly like the FIFO caches.
         self._fs_state: list | None = None
@@ -465,11 +469,19 @@ class Gr00tN1d6ActionHead(nn.Module):
             n_img = T
         flat_all = vis.reshape(B, Fn * n_img, d)
         self._pu_n_cand = Fn * n_img
+        self._pu_n_img = n_img
         if self._pu_score_pass:
+            if self.mem_fs_pos_rope:  # pass A KV = all candidates, in flat order
+                from gr00t.model.modules.fs_pos_rope import positions_from_flat
+                allc = torch.arange(Fn * n_img, device=flat_all.device).unsqueeze(0).expand(B, -1)
+                self._pu_positions = positions_from_flat(allc, n_img)
             return flat_all.contiguous()  # pass A: score every candidate
         budget = min(self.mem_framesamp_budget, Fn * n_img)
         n_diff = max(1, int(round(budget * self.mem_fs_diff_share)))
-        n_attn = max(0, budget - n_diff)
+        rem = max(0, budget - n_diff)
+        want_tail = self.mem_fs_tail_share > 0.0 and fs_image_mask_BFT is not None
+        n_tail = max(0, int(round(rem * self.mem_fs_tail_share))) if want_tail else 0
+        n_attn = max(0, rem - n_tail)
         with torch.no_grad():
             v32 = vis.detach().float()
             prev = torch.cat([v32[:, :1], v32[:, :-1]], dim=1)
@@ -479,20 +491,60 @@ class Gr00tN1d6ActionHead(nn.Module):
                 rel = self._pu_rel.to(v32.device).float().view(B, Fn, n_img)
             else:  # fallback (no captured attention): moment-token query
                 rel = torch.einsum("bfnd,bd->bfn", v32, moment_q_Bd.detach().float())
+            # tail_L15 channel: per-frame summary (mean of POST-IMAGE, PRE-MOMENT tokens on
+            # the FULL candidate frame, note-22) . patch, dot product. `vis` is already
+            # image-only, so recover the summary from fs_backbone_BFTd's tail region.
+            tail = None
+            if n_tail > 0:
+                n_q = int(getattr(self.config, "n_moment_tokens", 0))
+                mm = fs_image_mask_BFT.bool()
+                tq = torch.zeros(B, Fn, d, device=v32.device, dtype=torch.float32)
+                for b in range(B):
+                    for f in range(Fn):
+                        idx = mm[b, f].nonzero(as_tuple=True)[0]
+                        lo = int(idx[-1]) + 1 if idx.numel() else 0
+                        hi = T - n_q if n_q > 0 else T
+                        seg = fs_backbone_BFTd[b, f, lo:hi]
+                        if seg.shape[0]:
+                            tq[b, f] = seg.float().mean(0)
+                tail = torch.einsum("bfnd,bfd->bfn", v32, tq)
             flat_d = diff.reshape(B, Fn * n_img)
             flat_r = rel.reshape(B, Fn * n_img)
+            flat_t = tail.reshape(B, Fn * n_img) if tail is not None else None
             keep = []
             for b in range(B):
                 idx_d = torch.topk(flat_d[b], min(n_diff, flat_d.shape[1])).indices
                 idx_r = torch.topk(flat_r[b], min(n_attn, flat_r.shape[1])).indices if n_attn else idx_d[:0]
-                u = torch.unique(torch.cat([idx_d, idx_r]))
+                cat = [idx_d, idx_r]
+                if flat_t is not None and n_tail > 0:
+                    cat.append(torch.topk(flat_t[b], min(n_tail, flat_t.shape[1])).indices)
+                u = torch.unique(torch.cat(cat))
                 u = u.sort().values[:budget]
                 if u.numel() < budget:  # pad by repeating the last (kept in temporal order)
                     u = torch.cat([u, u[-1:].expand(budget - u.numel())])
                 keep.append(u)
             keep_idx = torch.stack(keep, dim=0)  # (B, budget) into F*n_img, temporal order
+        if self.mem_fs_pos_rope:  # pass B KV = the selected patches, in keep_idx order
+            from gr00t.model.modules.fs_pos_rope import positions_from_flat
+            self._pu_positions = positions_from_flat(keep_idx, n_img)
         return torch.gather(flat_all, 1, keep_idx.unsqueeze(-1).expand(B, budget, d)).contiguous()
 
+
+    def _pu_rope_on(self):
+        """Build cos/sin from self._pu_positions and arm the key-RoPE for the next DiT forward.
+        No-op unless mem_fs_pos_rope and positions are available."""
+        if not self.mem_fs_pos_rope or self._pu_positions is None:
+            return
+        from gr00t.model.modules.fs_patch_union import set_rope
+        from gr00t.model.modules.fs_pos_rope import build_cos_sin
+        cos, sin = build_cos_sin(self._pu_positions, self._pu_rope_hd)
+        set_rope(cos, sin, self._pu_positions.shape[1])
+
+    def _pu_rope_off(self):
+        if not self.mem_fs_pos_rope:
+            return
+        from gr00t.model.modules.fs_patch_union import clear_rope
+        clear_rope()
 
     @torch.no_grad()
     def _patch_union_score_pass(self, backbone_output, action_input):
@@ -539,7 +591,11 @@ class Gr00tN1d6ActionHead(nn.Module):
             if self.config.use_alternate_vl_dit:
                 kwargs["image_mask"] = bo.get("image_mask", None)
                 kwargs["backbone_attention_mask"] = bo.get("backbone_attention_mask", None)
-            self.model(**kwargs)
+            self._pu_rope_on()          # rotate the candidate keys during scoring too
+            try:
+                self.model(**kwargs)
+            finally:
+                self._pu_rope_off()
             scores = capture_end()
             if scores is None or scores.shape[0] != B:
                 return None
@@ -1052,7 +1108,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                             if self._fs_state is None or len(self._fs_state) != B:
                                 self._fs_state = [None] * B
                             Lm_kv = backbone_features.shape[1] - n_q
-                            rows_sel, pending = [], []
+                            rows_sel, pending, rows_pos = [], [], []
                             for b in range(B):
                                 sel_b = self._fs_state[b]
                                 if not isinstance(sel_b, PatchUnionSelector) or (
@@ -1062,15 +1118,35 @@ class Gr00tN1d6ActionHead(nn.Module):
                                         budget=self.mem_framesamp_budget,
                                         diff_share=self.mem_fs_diff_share,
                                         stride=self.mem_fs_diff_stride,
+                                        tail_share=self.mem_fs_tail_share,
                                     )
                                     self._fs_state[b] = sel_b
                                 v_b = vis_current[b].detach()
                                 idx_b = im_cur[b][:Lm_kv].nonzero(as_tuple=False).squeeze(1)[
                                     : v_b.shape[0]
                                 ]
-                                rows_sel.append(sel_b.read(v_b))
-                                pending.append((sel_b, v_b, idx_b))
+                                # tail_L15 channel: current frame's post-image, pre-moment
+                                # summary token -> patch dot product (matches training).
+                                tail_b = None
+                                if self.mem_fs_tail_share > 0.0:
+                                    im_row = im_cur[b][:Lm_kv]
+                                    ii = im_row.nonzero(as_tuple=False).squeeze(1)
+                                    if ii.numel():
+                                        last = int(ii[-1]) + 1
+                                        seg = backbone_features[b, last:Lm_kv]
+                                        if seg.shape[0]:
+                                            summ = seg.float().mean(0)
+                                            tail_b = (v_b.float() @ summ).cpu()
+                                if self.mem_fs_pos_rope:
+                                    r_b, p_b = sel_b.read(v_b, want_pos=True)
+                                    rows_pos.append(p_b)
+                                else:
+                                    r_b = sel_b.read(v_b)
+                                rows_sel.append(r_b)
+                                pending.append((sel_b, v_b, idx_b, tail_b))
                             self._pu_pending = pending
+                            self._pu_positions = (torch.stack(rows_pos, dim=0)
+                                                  if self.mem_fs_pos_rope and rows_pos else None)
                             n_cross = int(self.config.diffusion_model_cfg["num_layers"]) // 2
                             capture_begin(self.mem_fs_attn_layer, n_cross)
                             vis = torch.stack(rows_sel, dim=0)  # (B, budget, d)
@@ -1361,32 +1437,36 @@ class Gr00tN1d6ActionHead(nn.Module):
         # AdaLN-zero HAMLET: pooled memory vector added to the DiT timestep embedding.
         mem_temb_add = backbone_output.get("mem_temb_add", None)
 
-        if self.config.use_alternate_vl_dit:
-            image_mask = backbone_output.image_mask
-            backbone_attention_mask = backbone_output.backbone_attention_mask
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-                image_mask=image_mask,
-                backbone_attention_mask=backbone_attention_mask,
-                temb_add=mem_temb_add,
-                mem_seq=backbone_output.get("mem_seq", None),
-                mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
-            )
-        else:
-            model_output, _ = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=vl_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-                temb_add=mem_temb_add,
-                mem_seq=backbone_output.get("mem_seq", None),
-                mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
-            )
+        self._pu_rope_on()  # PPE key RoPE on the selected memory tail (no-op unless enabled)
+        try:
+            if self.config.use_alternate_vl_dit:
+                image_mask = backbone_output.image_mask
+                backbone_attention_mask = backbone_output.backbone_attention_mask
+                model_output, _ = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embeds,
+                    encoder_attention_mask=vl_attn_mask,
+                    timestep=t_discretized,
+                    return_all_hidden_states=True,
+                    image_mask=image_mask,
+                    backbone_attention_mask=backbone_attention_mask,
+                    temb_add=mem_temb_add,
+                    mem_seq=backbone_output.get("mem_seq", None),
+                    mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
+                )
+            else:
+                model_output, _ = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embeds,
+                    encoder_attention_mask=vl_attn_mask,
+                    timestep=t_discretized,
+                    return_all_hidden_states=True,
+                    temb_add=mem_temb_add,
+                    mem_seq=backbone_output.get("mem_seq", None),
+                    mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
+                )
+        finally:
+            self._pu_rope_off()
 
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
@@ -1502,26 +1582,30 @@ class Gr00tN1d6ActionHead(nn.Module):
             sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
-            if self.config.use_alternate_vl_dit:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    image_mask=backbone_output.image_mask,
-                    backbone_attention_mask=backbone_output.backbone_attention_mask,
-                    temb_add=mem_temb_add,
-                    mem_seq=backbone_output.get("mem_seq", None),
-                    mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
-                )
-            else:
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
-                    temb_add=mem_temb_add,
-                    mem_seq=backbone_output.get("mem_seq", None),
-                    mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
-                )
+            self._pu_rope_on()  # PPE key RoPE on the memory tail (no-op unless enabled)
+            try:
+                if self.config.use_alternate_vl_dit:
+                    model_output = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embeds,
+                        timestep=timesteps_tensor,
+                        image_mask=backbone_output.image_mask,
+                        backbone_attention_mask=backbone_output.backbone_attention_mask,
+                        temb_add=mem_temb_add,
+                        mem_seq=backbone_output.get("mem_seq", None),
+                        mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
+                    )
+                else:
+                    model_output = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embeds,
+                        timestep=timesteps_tensor,
+                        temb_add=mem_temb_add,
+                        mem_seq=backbone_output.get("mem_seq", None),
+                        mem_seq_spatial=backbone_output.get("mem_seq_spatial", None),
+                    )
+            finally:
+                self._pu_rope_off()
             pred = self.action_decoder(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]
@@ -1583,13 +1667,13 @@ class Gr00tN1d6ActionHead(nn.Module):
         pending, self._pu_pending = self._pu_pending, None
         if not pending:
             return
-        for b, (sel_b, v_b, idx_b) in enumerate(pending):
+        for b, (sel_b, v_b, idx_b, tail_b) in enumerate(pending):
             a = None
             if attn_scores is not None and b < attn_scores.shape[0]:
                 row = attn_scores[b]
                 if idx_b is not None and idx_b.numel() > 0 and int(idx_b.max()) < row.shape[0]:
                     a = row[idx_b.to(row.device)].float().cpu()
-            sel_b.observe(v_b, None, a)
+            sel_b.observe(v_b, None, a, tail_b)
 
     @property
     def device(self):

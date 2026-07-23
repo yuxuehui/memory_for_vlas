@@ -303,6 +303,15 @@ class FinetuneConfig:
     mem_fs_diff_share: float = 0.5
     """mem_fs_select='patch_union': novelty-channel share of the patch budget (rest = relevance)."""
 
+    mem_fs_tail_share: float = 0.0
+    """mem_fs_select='patch_union': of the NON-novelty budget, the share going to the tail_L15
+    channel (patch . frame-summary dot product; note-22). 0.0 = 2-way nov∪act (default,
+    backward-compatible); 0.5 = 3-way nov∪act∪tail with equal act/tail."""
+
+    mem_fs_pos_rope: bool = False
+    """mem_fs_select='patch_union': PPE-style 3D RoPE (Δt,y,x) on the stored memory keys in the
+    DiT cross-attention (note-23). False = no position (default, backward-compatible)."""
+
     mem_framesamp_frames: int = 8
     """`mem_source='framesamp'` only — number of EPISODE-SPANNING video frames the loader
     even-`linspace`-samples across the WHOLE episode (independent of the K-step

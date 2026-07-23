@@ -163,6 +163,8 @@ Everything is a flag on `gr00t/experiment/launch_finetune.py` (`gr00t/configs/fi
 | `--mem-fs-diff-stride` | `8` | int | scoring cadence for `diff`/`patch_union` (env steps at train, **policy calls** at eval — if the server is hit once per action chunk the effective stride is 8×chunk) |
 | `--mem-fs-attn-layer` | `13` | int | `patch_union` only — DiT cross-attn layer whose action→patch attention is the relevance channel |
 | `--mem-fs-diff-share` | `0.5` | float | `patch_union` only — novelty-channel share of the patch budget (rest = relevance) |
+| `--mem-fs-tail-share` | `0.0` | float | `patch_union` only — tail_L15 3rd-channel share of the **non-novelty** budget (`0.0` = 2-way `nov∪act`; `0.5` = 3-way `nov∪act∪tail`) |
+| `--mem-fs-pos-rope` | `false` | flag | `patch_union` only — PPE-style 3D key-RoPE (Δt,y,x) on the stored memory tokens in the DiT cross-attention |
 | `--mem-film-layers` | `all` | `all`/`mid`/`8,10,12`/`8-20` | FiLM injection depth (`modul` only) |
 | `--mem-image-side` | `False` | bool | route memory tokens via IMAGE (vs TEXT) cross-attn pathway (`cross_attn` only) |
 | `--load-moment-tokens-from` | `None` | path | warm-start moment tokens from a Stage-1 TCL checkpoint |
@@ -279,6 +281,25 @@ torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune
 ```
 `patch_union` currently supports **`--mem-cond-type cross_attn` only** (the sdpa capture counts one
 cross-attn call per DiT block; `modul` adds a second and breaks the layer counter — asserted in code).
+
+**Two extra channels (both opt-in, both trained-in, both default off — a plain 2-way `novelty ∪ act` ckpt is unaffected):**
+
+```bash
+  # (a) 3rd selection channel — tail_L15 (backbone post-image summary → patch), so the budget
+  #     is novelty ∪ act ∪ tail. `--mem-fs-tail-share` = the tail share of the NON-novelty budget
+  #     (0.5 → novelty 256 / act 128 / tail 128). Adds spatial spread the act channel misses.
+  --mem-fs-tail-share 0.5 \
+
+  # (b) PPE-style 3D key-RoPE on the stored memory tokens (Δt,y,x), so the DiT cross-attention's
+  #     QK dot product can USE each patch's position (a probe showed position is decodable from
+  #     the token but the attention has no RoPE to exploit it). Keys-only rotation, K=1.
+  --mem-fs-pos-rope
+```
+
+Both round-trip through the ckpt config; on an old ckpt override at eval with
+`run_gr00t_server.py --mem-fs-tail-share 0.5 --mem-fs-pos-rope`. Files:
+`modules/fs_pos_rope.py` (3D RoPE math), rotation folded into `modules/fs_patch_union.py`'s
+sdpa patch (rotates only the memory-tail keys of a cross-attn; self-attn untouched).
 
 ### Evaluation (RoboMME rollout)
 

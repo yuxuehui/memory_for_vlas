@@ -60,6 +60,12 @@ class ServerConfig:
     mem_fs_attn_layer: int | None = None
     """patch_union: DiT cross-attn layer for the attention channel (default 13)."""
 
+    mem_fs_tail_share: float | None = None
+    """patch_union: tail_L15 channel share of the non-novelty budget (default 0.0 = 2-way)."""
+
+    mem_fs_pos_rope: bool | None = None
+    """patch_union: PPE-style 3D key RoPE on memory tokens (default from checkpoint)."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T inference server...")
@@ -93,6 +99,12 @@ def main(config: ServerConfig):
         if config.mem_fs_attn_layer is not None:
             policy.model.action_head.mem_fs_attn_layer = int(config.mem_fs_attn_layer)
             print(f"  mem_fs_attn_layer override: {config.mem_fs_attn_layer}")
+        if config.mem_fs_tail_share is not None:
+            policy.model.action_head.mem_fs_tail_share = float(config.mem_fs_tail_share)
+            print(f"  mem_fs_tail_share override: {config.mem_fs_tail_share}")
+        if config.mem_fs_pos_rope is not None:
+            policy.model.action_head.mem_fs_pos_rope = bool(config.mem_fs_pos_rope)
+            print(f"  mem_fs_pos_rope override: {config.mem_fs_pos_rope}")
     elif config.dataset_path is not None:
         if config.modality_config_path is None:
             from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS

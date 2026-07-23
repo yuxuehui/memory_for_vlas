@@ -175,6 +175,11 @@ class Gr00tN1d6Config(PretrainedConfig):
     # channel, and the diff channel share of the patch budget.
     mem_fs_attn_layer: int = 13
     mem_fs_diff_share: float = 0.5
+    # patch_union 3rd channel: of the NON-novelty budget, the share for tail_L15
+    # (patch . frame-summary dot product). 0.0 = 2-way nov∪act; 0.5 = 3-way equal act/tail.
+    mem_fs_tail_share: float = 0.0
+    # patch_union: PPE-style 3D RoPE (Δt,y,x) on stored memory keys in DiT cross-attn (note-23).
+    mem_fs_pos_rope: bool = False
     # mem_cond_type=="cross_attn" only. Cross-attn ROUTING for the memory tokens that ride
     # the action-head KV. False (default) = memory tagged image_mask=False (TEXT pathway,
     # current behavior); True = memory tagged image_mask=True (IMAGE pathway). Only the
