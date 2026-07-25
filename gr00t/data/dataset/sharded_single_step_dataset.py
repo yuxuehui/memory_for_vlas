@@ -66,6 +66,39 @@ def _fs_diff_indices(
     return idxs[:fs_frames]
 
 
+def _fs_pu_indices(
+    steps: np.ndarray, scores: np.ndarray, anchor: int, fs_frames: int
+) -> list[int]:
+    """CAUSAL keyframes for mem_fs_select='patch_union'. Differs from the TokenDrop
+    `_fs_diff_indices` in two ways required by the patch_union INFERENCE selector
+    (PatchUnionSelector.read reads history < t; the current frame is committed only AFTER
+    the action, so it never enters the memory the action is conditioned on):
+
+      1. EXCLUDE the anchor. Candidates are frame-0 + the top-(F-1) diff-peak scored steps
+         STRICTLY BELOW the anchor — so training memory, like inference, holds only history<t.
+      2. Pad with DISTINCT causal frames (linspace over [0, anchor)) rather than repeating the
+         anchor. `_patch_union_mem_seq` dedups on FLAT INDEX, not content, so index-distinct
+         duplicates of one frame would let the relevance/tail channels select the same patch
+         many times, wasting the budget. Repeats only remain when the history is genuinely too
+         short (anchor near 0) — which faithfully mirrors the not-yet-full inference heap."""
+    mask = steps < anchor
+    s, sc = steps[mask], scores[mask]
+    k = max(0, fs_frames - 1)
+    keep = s[np.argsort(sc)[::-1][:k]] if len(s) > k else s
+    idxs = sorted({0} | {int(x) for x in keep})[:fs_frames]
+    if len(idxs) < fs_frames:
+        hi = max(0, anchor - 1)
+        for f in np.linspace(0, hi, num=fs_frames).round().astype(int):
+            if len(idxs) >= fs_frames:
+                break
+            if int(f) not in idxs:
+                idxs.append(int(f))
+        idxs = sorted(idxs)
+        while len(idxs) < fs_frames:  # anchor near 0: no distinct history -> unavoidable repeat
+            idxs.append(idxs[-1])
+    return sorted(idxs)[:fs_frames]
+
+
 def extract_step_data(
     episode_data: pd.DataFrame,
     step_index: int,
@@ -135,10 +168,13 @@ def extract_step_data(
         # framesamp_frames defaults to 0 -> this block is a no-op for every other config.
         fs_frames = int(getattr(config, "framesamp_frames", 0)) if modality == "video" else 0
         if fs_frames > 0:
-            if getattr(config, "framesamp_select", "linspace") == "diff":
-                # TokenDrop-style CAUSAL keyframes (frame 0 + top-diff <= anchor + anchor),
-                # matching the inference DiffFrameSelector — unlike the linspace path below,
-                # which is acausal (spans the whole episode incl. future frames).
+            _fsel = getattr(config, "framesamp_select", "linspace")
+            if _fsel in ("diff", "patch_union"):
+                # CAUSAL keyframes (frame 0 + top pixel-diff peaks <= anchor), matching the
+                # inference selector — unlike the linspace path below, which is ACAUSAL (spans
+                # the whole episode incl. future frames). 'diff' (TokenDrop) includes the anchor
+                # as the last frame (its DiffFrameSelector.read does too); 'patch_union' EXCLUDES
+                # the anchor (its PatchUnionSelector.read holds history<t) — see _fs_pu_indices.
                 anchor = max(0, min(step_index, traj_len - 1))
                 video_cols = [
                     f"{modality}.{k}"
@@ -147,7 +183,11 @@ def extract_step_data(
                 ]
                 fs_stride = int(getattr(config, "framesamp_diff_stride", 8))
                 steps, scores = _fs_diff_scores(episode_data, video_cols, fs_stride)
-                episode_idxs = _fs_diff_indices(steps, scores, anchor, fs_frames)
+                episode_idxs = (
+                    _fs_pu_indices(steps, scores, anchor, fs_frames)
+                    if _fsel == "patch_union"
+                    else _fs_diff_indices(steps, scores, anchor, fs_frames)
+                )
             else:
                 episode_idxs = (
                     np.linspace(0, traj_len - 1, num=fs_frames).round().astype(int).tolist()

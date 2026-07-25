@@ -15,8 +15,9 @@ the z-sum combination on redundancy/coverage/demo-share).
 
 Stored entries are the raw backbone vision tokens of the selected cells — the same
 token type the framesamp mem_seq carries, so a framesamp-trained policy consumes them
-without architecture changes. Known v1 limitation: no explicit (t, y, x) tagging
-(note-16 v2b lesson) — stored tokens rely on content identity alone.
+without architecture changes. (t, y, x) tagging: off by default (content identity only,
+the v1 behavior); with `mem_fs_pos_rope=True` each stored key is rotated by a PPE-style
+3D RoPE over (Δt=recency rank, y with wrist folded, x) — see fs_pos_rope.py / note-21 §8.
 """
 
 from __future__ import annotations
@@ -151,6 +152,7 @@ class PatchUnionSelector:
         self.attn_heap: list = []
         self.tail_heap: list = []
         self.last_cells: torch.Tensor | None = None
+        self.last_tok: torch.Tensor | None = None   # previous scored frame's (n_img, d) tokens
         self.step = -1
 
     @staticmethod
@@ -168,16 +170,24 @@ class PatchUnionSelector:
         channel). attn/tail are None on the first call."""
         self.step += 1
         n_img = vis.shape[0]
-        sig = cells if cells is not None else vis.detach().float().mean(-1)
         if self.step == 0:
             ppv = n_img // 2 if n_img % 2 == 0 else n_img
             for i in range(min(ppv, n_img)):  # frame-0 FRONT cells: TokenDrop sentinel
                 self._push(self.diff_heap, self.n_diff, (1e9, 0, i, vis[i].detach()))
-            self.last_cells = sig
+            self.last_cells = cells
+            self.last_tok = vis.detach().float()
             return
         if self.step % self.stride == 0:
-            d = (sig - self.last_cells).abs()
-            self.last_cells = sig
+            if cells is not None and self.last_cells is not None:
+                d = (cells - self.last_cells).abs()          # pixel-cell variant (unused today)
+                self.last_cells = cells
+            else:
+                # TRAIN-MATCHING novelty: per-dim mean|Δ| of the full token, exactly
+                # `_patch_union_mem_seq`'s (v_t - v_{t-1}).abs().mean(-1). The old scalar
+                # shortcut |mean(v_t) - mean(v_{t-1})| under-detects semantic change
+                # (|mean Δ| <= mean|Δ|) and was a train/infer formula mismatch.
+                d = (vis.detach().float() - self.last_tok).abs().mean(-1)
+            self.last_tok = vis.detach().float()
             for i in range(n_img):
                 s = float(d[i])
                 if s > 1e-4:
@@ -189,11 +199,17 @@ class PatchUnionSelector:
             for i in range(n_img):
                 self._push(self.tail_heap, self.n_tail, (float(tail[i]), self.step, i, vis[i].detach()))
 
-    def read(self, vis_current: torch.Tensor, want_pos: bool = False, n_views: int = 2):
+    def read(self, vis_current: torch.Tensor, want_pos: bool = False, n_views: int = 2,
+             pos_frames: int = 8):
         """(budget, d): union of all heaps in (step, idx) order, deduped, padded with
         current-frame tokens to exactly budget rows. If want_pos, also return (budget, 3)
-        (Δt, y, x) for PPE key RoPE: Δt = current_step - entry_step (recency), y (wrist folded
-        +side), x — matching fs_pos_rope.positions_from_flat's scheme."""
+        (Δt, y, x) for PPE key RoPE.
+
+        Δt is the RECENCY RANK over the distinct steps held in memory, normalized onto
+        [0, pos_frames-1] (0 = newest) — matching the TRAINING side, where Δt is the rank
+        among the F causally-selected candidate frames (fs_pos_rope.positions_from_flat).
+        Raw step-distance (self.step - t) would be OOD: training only ever produces Δt in
+        [0, F-1], and RoPE angles outside that support were never trained."""
         seen, entries = set(), []
         for heap in (self.diff_heap, self.attn_heap, self.tail_heap):
             for (s, t, i, tok) in heap:
@@ -209,16 +225,25 @@ class PatchUnionSelector:
         if want_pos:
             per_view = max(1, n_img // n_views)
             side = int(round(per_view ** 0.5))
+            steps_desc = sorted({t for (t, _i, _tok) in kept}, reverse=True)  # newest first
+            rank_of = {t: r for r, t in enumerate(steps_desc)}
+            denom = max(1, len(steps_desc) - 1)
+            span = max(0, pos_frames - 1)
             pos = []
             for (t, i, _tok) in kept:
                 view = min(i // per_view, n_views - 1)
                 within = i % per_view
-                pos.append([self.step - t, within // side + view * side, within % side])
+                dt = int(round(rank_of[t] / denom * span)) if denom else 0
+                pos.append([dt, within // side + view * side, within % side])
         k = 0
         while len(toks) < self.budget:
-            toks.append(vis_current[k % n_img])
+            idx = k % n_img
+            toks.append(vis_current[idx])
             if want_pos:
-                pos.append([0, 0, 0])           # current-frame padding at Δt=0
+                # padding = real current-frame patches: true (y, x), Δt=0 (newest)
+                view = min(idx // per_view, n_views - 1)
+                within = idx % per_view
+                pos.append([0, within // side + view * side, within % side])
             k += 1
         out = torch.stack(toks, dim=0)
         if want_pos:

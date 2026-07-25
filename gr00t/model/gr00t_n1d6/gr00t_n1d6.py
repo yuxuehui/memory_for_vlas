@@ -486,7 +486,10 @@ class Gr00tN1d6ActionHead(nn.Module):
             v32 = vis.detach().float()
             prev = torch.cat([v32[:, :1], v32[:, :-1]], dim=1)
             diff = (v32 - prev).abs().mean(-1)  # (B, F, n_img)
-            diff[:, 0, :] = float("inf")  # frame-0 sentinel (TokenDrop)
+            # frame-0 FRONT sentinel (TokenDrop): matches inference observe() step-0, which
+            # protects only the front half; all-view inf would eat 2x the novelty slots.
+            _half = n_img // 2 if n_img % 2 == 0 else n_img
+            diff[:, 0, :_half] = float("inf")
             if self._pu_rel is not None and self._pu_rel.shape[-1] == Fn * n_img:
                 rel = self._pu_rel.to(v32.device).float().view(B, Fn, n_img)
             else:  # fallback (no captured attention): moment-token query
@@ -535,6 +538,19 @@ class Gr00tN1d6ActionHead(nn.Module):
         No-op unless mem_fs_pos_rope and positions are available."""
         if not self.mem_fs_pos_rope or self._pu_positions is None:
             return
+        # Key-RoPE rides GLOBAL state that is cleared right after the forward. Gradient
+        # checkpointing would RECOMPUTE the DiT forward during backward — after clear_rope —
+        # so the recomputed keys would be unrotated: silent forward/recompute mismatch and
+        # wrong gradients. Our runs keep checkpointing off (training_config default False);
+        # refuse loudly rather than corrupt gradients if someone turns it on.
+        if getattr(self, "training", False) and getattr(
+            getattr(self, "model", None), "gradient_checkpointing", False
+        ):
+            raise RuntimeError(
+                "mem_fs_pos_rope is incompatible with gradient_checkpointing on the DiT: "
+                "the rope global state is cleared before backward-time recompute, which "
+                "would silently produce wrong gradients. Disable one of the two."
+            )
         from gr00t.model.modules.fs_patch_union import set_rope
         from gr00t.model.modules.fs_pos_rope import build_cos_sin
         cos, sin = build_cos_sin(self._pu_positions, self._pu_rope_hd)
@@ -1138,7 +1154,10 @@ class Gr00tN1d6ActionHead(nn.Module):
                                             summ = seg.float().mean(0)
                                             tail_b = (v_b.float() @ summ).cpu()
                                 if self.mem_fs_pos_rope:
-                                    r_b, p_b = sel_b.read(v_b, want_pos=True)
+                                    r_b, p_b = sel_b.read(
+                                        v_b, want_pos=True,
+                                        pos_frames=self.mem_framesamp_frames,
+                                    )
                                     rows_pos.append(p_b)
                                 else:
                                     r_b = sel_b.read(v_b)

@@ -175,11 +175,15 @@ if __name__ == "__main__":
                 MODALITY_CONFIGS[tag]["video"].delta_indices = new_indices
                 MODALITY_CONFIGS[tag]["video"].framesamp_frames = fs_frames
                 MODALITY_CONFIGS[tag]["video"].mem_window_mode = ft_config.mem_window_mode
-                # TokenDrop-style training frames: loader selects CAUSAL diff keyframes
-                # instead of acausal whole-episode linspace (mem_fs_select='diff' only).
-                MODALITY_CONFIGS[tag]["video"].framesamp_select = (
-                    "diff" if ft_config.mem_fs_select == "diff" else "linspace"
-                )
+                # CAUSAL training keyframes instead of acausal whole-episode linspace, so the
+                # training candidate pool matches the causal inference selector. 'diff'
+                # (TokenDrop) and 'patch_union' each map to their own causal frame indexer
+                # (the latter excludes the anchor to match its history<t read); everything
+                # else (fifo/exp-d, linspace baselines) stays acausal linspace.
+                MODALITY_CONFIGS[tag]["video"].framesamp_select = {
+                    "diff": "diff",
+                    "patch_union": "patch_union",
+                }.get(ft_config.mem_fs_select, "linspace")
                 MODALITY_CONFIGS[tag]["video"].framesamp_diff_stride = (
                     ft_config.mem_fs_diff_stride
                 )
