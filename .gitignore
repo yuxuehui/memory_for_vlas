@@ -171,4 +171,9 @@ offline_open_loop_eval_plots/
 
 # Generic model/data folders
 /models
-/data
+# data/ is ignored EXCEPT robomme/meta (authored modality/info/stats JSONs, tracked so cloud
+# checkouts get them); the parquet chunks stay on local storage behind data/robomme/data.
+/data/*
+!/data/robomme
+/data/robomme/*
+!/data/robomme/meta

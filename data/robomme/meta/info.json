@@ -1,0 +1,169 @@
+{
+    "codebase_version": "v2.1",
+    "robot_type": "panda",
+    "total_episodes": 1600,
+    "total_frames": 768897,
+    "total_tasks": 116,
+    "total_videos": 0,
+    "total_chunks": 2,
+    "chunks_size": 1000,
+    "fps": 10,
+    "splits": {
+        "train": "0:1600"
+    },
+    "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+    "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+    "features": {
+        "image": {
+            "dtype": "image",
+            "shape": [
+                256,
+                256,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channel"
+            ]
+        },
+        "wrist_image": {
+            "dtype": "image",
+            "shape": [
+                256,
+                256,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channel"
+            ]
+        },
+        "state": {
+            "dtype": "float32",
+            "shape": [
+                8
+            ],
+            "names": [
+                "state"
+            ]
+        },
+        "actions": {
+            "dtype": "float32",
+            "shape": [
+                8
+            ],
+            "names": [
+                "actions"
+            ]
+        },
+        "exec_start_idx": {
+            "dtype": "int32",
+            "shape": [
+                1
+            ],
+            "names": [
+                "execution start idx in current episode"
+            ]
+        },
+        "is_demo": {
+            "dtype": "bool",
+            "shape": [
+                1
+            ],
+            "names": [
+                "is video demo"
+            ]
+        },
+        "step_idx": {
+            "dtype": "int32",
+            "shape": [
+                1
+            ],
+            "names": [
+                "step_idx"
+            ]
+        },
+        "epis_idx": {
+            "dtype": "int32",
+            "shape": [
+                1
+            ],
+            "names": [
+                "epis_idx"
+            ]
+        },
+        "simple_subgoal": {
+            "dtype": "string",
+            "shape": [
+                1
+            ],
+            "names": [
+                "simple subgoal"
+            ]
+        },
+        "grounded_subgoal": {
+            "dtype": "string",
+            "shape": [
+                1
+            ],
+            "names": [
+                "detailed subgoal with grounding information, e.g, object location"
+            ]
+        },
+        "simple_subgoal_online": {
+            "dtype": "string",
+            "shape": [
+                1
+            ],
+            "names": [
+                "simple subgoal online"
+            ]
+        },
+        "grounded_subgoal_online": {
+            "dtype": "string",
+            "shape": [
+                1
+            ],
+            "names": [
+                "detailed subgoal with grounding information, e.g, object location"
+            ]
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    }
+}

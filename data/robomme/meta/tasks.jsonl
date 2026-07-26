@@ -1,0 +1,116 @@
+{"task_index": 0, "task": "watch the video carefully, then use the stick attached to the robot to retrace the same pattern"}
+{"task_index": 1, "task": "first press both buttons on the table, then pick up the container hiding the blue cube, finally pick up another container hiding the green cube"}
+{"task_index": 2, "task": "first press both buttons on the table, then pick up the container hiding the red cube, finally pick up another container hiding the green cube"}
+{"task_index": 3, "task": "first press both buttons on the table, then pick up the container hiding the green cube"}
+{"task_index": 4, "task": "first press both buttons on the table, then pick up the container hiding the green cube, finally pick up another container hiding the blue cube"}
+{"task_index": 5, "task": "first press both buttons on the table, then pick up the container hiding the red cube"}
+{"task_index": 6, "task": "first press both buttons on the table, then pick up the container hiding the green cube, finally pick up another container hiding the red cube"}
+{"task_index": 7, "task": "first press both buttons on the table, then pick up the container hiding the blue cube"}
+{"task_index": 8, "task": "first press both buttons on the table, then pick up the container hiding the blue cube, finally pick up another container hiding the red cube"}
+{"task_index": 9, "task": "first press both buttons on the table, then pick up the container hiding the red cube, finally pick up another container hiding the blue cube"}
+{"task_index": 10, "task": "first press the button, then pick up the container hiding the red cube"}
+{"task_index": 11, "task": "first press the button, then pick up the container hiding the green cube"}
+{"task_index": 12, "task": "first press the button, then pick up the container hiding the red cube, finally pick up another container hiding the blue cube"}
+{"task_index": 13, "task": "first press the button, then pick up the container hiding the blue cube"}
+{"task_index": 14, "task": "first press the button, then pick up the container hiding the blue cube, finally pick up another container hiding the red cube"}
+{"task_index": 15, "task": "first press the button, then pick up the container hiding the green cube, finally pick up another container hiding the red cube"}
+{"task_index": 16, "task": "first press the button, then pick up the container hiding the green cube, finally pick up another container hiding the blue cube"}
+{"task_index": 17, "task": "first press the button, then pick up the container hiding the blue cube, finally pick up another container hiding the green cube"}
+{"task_index": 18, "task": "watch the video carefully, then place the red cube on the target right after the button was pressed"}
+{"task_index": 19, "task": "watch the video carefully, then place the blue cube on the target right after the button was pressed"}
+{"task_index": 20, "task": "watch the video carefully, then place the green cube on the target right before the button was pressed"}
+{"task_index": 21, "task": "watch the video carefully, then place the green cube on the target right after the button was pressed"}
+{"task_index": 22, "task": "watch the video carefully, then place the red cube on the target right before the button was pressed"}
+{"task_index": 23, "task": "watch the video carefully, then place the blue cube on the target right before the button was pressed"}
+{"task_index": 24, "task": "watch the video carefully, then pick up the container hiding the green cube"}
+{"task_index": 25, "task": "watch the video carefully, then pick up the container hiding the blue cube"}
+{"task_index": 26, "task": "watch the video carefully, then pick up the container hiding the blue cube, finally pick up another container hiding the red cube"}
+{"task_index": 27, "task": "watch the video carefully, then pick up the container hiding the green cube, finally pick up another container hiding the red cube"}
+{"task_index": 28, "task": "watch the video carefully, then pick up the container hiding the blue cube, finally pick up another container hiding the green cube"}
+{"task_index": 29, "task": "watch the video carefully, then pick up the container hiding the green cube, finally pick up another container hiding the blue cube"}
+{"task_index": 30, "task": "watch the video carefully, then pick up the container hiding the red cube, finally pick up another container hiding the green cube"}
+{"task_index": 31, "task": "watch the video carefully, then pick up the container hiding the red cube"}
+{"task_index": 32, "task": "watch the video carefully, then pick up the container hiding the red cube, finally pick up another container hiding the blue cube"}
+{"task_index": 33, "task": "pick up the red cube and place it on the target, repeating this action two times, then press the button to stop"}
+{"task_index": 34, "task": "pick up the blue cube and place it on the target, repeating this action three times, then press the button to stop"}
+{"task_index": 35, "task": "pick up the green cube and place it on the target, repeating this action four times, then press the button to stop"}
+{"task_index": 36, "task": "pick up the green cube and place it on the target, repeating this action two times, then press the button to stop"}
+{"task_index": 37, "task": "pick up the green cube and place it on the target, repeating this action five times, then press the button to stop"}
+{"task_index": 38, "task": "pick up the red cube and place it on the target, then press the button to stop"}
+{"task_index": 39, "task": "pick up the green cube and place it on the target, repeating this action three times, then press the button to stop"}
+{"task_index": 40, "task": "pick up the green cube and place it on the target, then press the button to stop"}
+{"task_index": 41, "task": "pick up the blue cube and place it on the target, repeating this action four times, then press the button to stop"}
+{"task_index": 42, "task": "pick up the red cube and place it on the target, repeating this action five times, then press the button to stop"}
+{"task_index": 43, "task": "pick up the blue cube and place it on the target, repeating this action two times, then press the button to stop"}
+{"task_index": 44, "task": "pick up the blue cube and place it on the target, repeating this action five times, then press the button to stop"}
+{"task_index": 45, "task": "pick up the blue cube and place it on the target, then press the button to stop"}
+{"task_index": 46, "task": "pick up the red cube and place it on the target, repeating this action three times, then press the button to stop"}
+{"task_index": 47, "task": "pick up the red cube and place it on the target, repeating this action four times, then press the button to stop"}
+{"task_index": 48, "task": "press the button to stop the cube just as it reaches the target for the fourth time"}
+{"task_index": 49, "task": "press the button to stop the cube just as it reaches the target for the third time"}
+{"task_index": 50, "task": "press the button to stop the cube just as it reaches the target for the second time"}
+{"task_index": 51, "task": "press the button to stop the cube just as it reaches the target for the fifth time"}
+{"task_index": 52, "task": "pick up the red cube, move it to the top of the right-side target, then move it to the top of the left-side target, repeating this back and forth motion two times, finally press the button to stop"}
+{"task_index": 53, "task": "pick up the green cube, move it to the top of the right-side target, then move it to the top of the left-side target, repeating this back and forth motion three times, finally press the button to stop"}
+{"task_index": 54, "task": "pick up the green cube, move it to the top of the right-side target, then put it down on the left-side target, finally press the button to stop"}
+{"task_index": 55, "task": "pick up the red cube, move it to the top of the right-side target, then move it to the top of the left-side target, repeating this back and forth motion three times, finally press the button to stop"}
+{"task_index": 56, "task": "pick up the blue cube, move it to the top of the right-side target, then move it to the top of the left-side target, repeating this back and forth motion two times, finally press the button to stop"}
+{"task_index": 57, "task": "pick up the green cube, move it to the top of the right-side target, then move it to the top of the left-side target, repeating this back and forth motion two times, finally press the button to stop"}
+{"task_index": 58, "task": "pick up the blue cube, move it to the top of the right-side target, then move it to the top of the left-side target, repeating this back and forth motion three times, finally press the button to stop"}
+{"task_index": 59, "task": "pick up the red cube, move it to the top of the right-side target, then put it down on the left-side target, finally press the button to stop"}
+{"task_index": 60, "task": "pick up the blue cube, move it to the top of the right-side target, then put it down on the left-side target, finally press the button to stop"}
+{"task_index": 61, "task": "first press the button, then pick up all cubes that have been highlighteted with white areas on the table"}
+{"task_index": 62, "task": "watch the video carefully, then move the cube to the target in the same manner as before"}
+{"task_index": 63, "task": "watch the video carefully, then grasp the same end of the same peg you've picked before and insert it into the same side of the box"}
+{"task_index": 64, "task": "watch the video carefully, then use the stick attached to the robot to navigate around the sticks on the table, following the same path"}
+{"task_index": 65, "task": "put two red cubes into the bin, then press the button to stop"}
+{"task_index": 66, "task": "put one red cube into the bin, then press the button to stop"}
+{"task_index": 67, "task": "put two red cubes and two green cubes into the bin, then press the button to stop"}
+{"task_index": 68, "task": "put one blue cube and three green cubes into the bin, then press the button to stop"}
+{"task_index": 69, "task": "put two blue cubes into the bin, then press the button to stop"}
+{"task_index": 70, "task": "put three blue cubes into the bin, then press the button to stop"}
+{"task_index": 71, "task": "put two red cubes and two blue cubes into the bin, then press the button to stop"}
+{"task_index": 72, "task": "put three green cubes into the bin, then press the button to stop"}
+{"task_index": 73, "task": "put two red cubes and one green cube into the bin, then press the button to stop"}
+{"task_index": 74, "task": "put three red cubes into the bin, then press the button to stop"}
+{"task_index": 75, "task": "put three red cubes and one blue cube into the bin, then press the button to stop"}
+{"task_index": 76, "task": "put two green cubes into the bin, then press the button to stop"}
+{"task_index": 77, "task": "put one blue cube into the bin, then press the button to stop"}
+{"task_index": 78, "task": "put four green cubes into the bin, then press the button to stop"}
+{"task_index": 79, "task": "put one red cube, two blue cubes and one green cube into the bin, then press the button to stop"}
+{"task_index": 80, "task": "put three blue cubes and one green cube into the bin, then press the button to stop"}
+{"task_index": 81, "task": "put two blue cubes and two green cubes into the bin, then press the button to stop"}
+{"task_index": 82, "task": "put three blue cubes and two green cubes into the bin, then press the button to stop"}
+{"task_index": 83, "task": "put three red cubes and one green cube into the bin, then press the button to stop"}
+{"task_index": 84, "task": "put one red cube and two blue cubes into the bin, then press the button to stop"}
+{"task_index": 85, "task": "put one red cube and one green cube into the bin, then press the button to stop"}
+{"task_index": 86, "task": "put two red cubes and one blue cube into the bin, then press the button to stop"}
+{"task_index": 87, "task": "put two blue cubes and three green cubes into the bin, then press the button to stop"}
+{"task_index": 88, "task": "put four red cubes into the bin, then press the button to stop"}
+{"task_index": 89, "task": "put one green cube into the bin, then press the button to stop"}
+{"task_index": 90, "task": "put four blue cubes into the bin, then press the button to stop"}
+{"task_index": 91, "task": "put one red cube and one blue cube into the bin, then press the button to stop"}
+{"task_index": 92, "task": "put two red cubes and three green cubes into the bin, then press the button to stop"}
+{"task_index": 93, "task": "put two red cubes, two blue cubes and one green cube into the bin, then press the button to stop"}
+{"task_index": 94, "task": "put four blue cubes and one green cube into the bin, then press the button to stop"}
+{"task_index": 95, "task": "put one red cube, three blue cubes and one green cube into the bin, then press the button to stop"}
+{"task_index": 96, "task": "put one red cube and three green cubes into the bin, then press the button to stop"}
+{"task_index": 97, "task": "put one red cube and three blue cubes into the bin, then press the button to stop"}
+{"task_index": 98, "task": "put two red cubes, one blue cube and two green cubes into the bin, then press the button to stop"}
+{"task_index": 99, "task": "put one red cube, one blue cube and one green cube into the bin, then press the button to stop"}
+{"task_index": 100, "task": "put one blue cube and two green cubes into the bin, then press the button to stop"}
+{"task_index": 101, "task": "watch the video carefully, then place the blue cube on the first target it was previously placed on"}
+{"task_index": 102, "task": "watch the video carefully, then place the green cube on the fourth target it was previously placed on"}
+{"task_index": 103, "task": "watch the video carefully, then place the red cube on the second target it was previously placed on"}
+{"task_index": 104, "task": "watch the video carefully, then place the green cube on the third target it was previously placed on"}
+{"task_index": 105, "task": "watch the video carefully, then place the blue cube on the third target it was previously placed on"}
+{"task_index": 106, "task": "watch the video carefully, then place the green cube on the second target it was previously placed on"}
+{"task_index": 107, "task": "watch the video carefully, then place the blue cube on the second target it was previously placed on"}
+{"task_index": 108, "task": "watch the video carefully, then place the green cube on the first target it was previously placed on"}
+{"task_index": 109, "task": "watch the video carefully, then place the red cube on the first target it was previously placed on"}
+{"task_index": 110, "task": "watch the video carefully, then place the red cube on the third target it was previously placed on"}
+{"task_index": 111, "task": "watch the video carefully, then place the blue cube on the fourth target it was previously placed on"}
+{"task_index": 112, "task": "watch the video carefully, then place the red cube on the fourth target it was previously placed on"}
+{"task_index": 113, "task": "watch the video carefully, then repeatedly pick up and put down the same block that was previously picked up for two times, finally put it down and press the button to stop"}
+{"task_index": 114, "task": "watch the video carefully, then repeatedly pick up and put down the same block that was previously picked up for three times, finally put it down and press the button to stop"}
+{"task_index": 115, "task": "watch the video carefully, then pick up the same block that was previously picked up again, finally put it down and press the button to stop"}
