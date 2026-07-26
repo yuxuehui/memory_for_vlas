@@ -126,7 +126,6 @@ class Gr00tN1d6ActionHead(nn.Module):
                 var_ckpt=str(getattr(config, "mem_varp_ckpt", "")),
             )
             self.mem_varp_view = int(getattr(config, "mem_varp_view", 0))
-        self._varp_pixels = None  # rolling-inference pixel FIFO (B, F, 3, H, W), detached
         # Per-session selector list at inference (DiffFrameSelector | PatchUnionSelector);
         # Gr00tPolicy round-trips it across calls exactly like the FIFO caches.
         self._fs_state: list | None = None
@@ -616,23 +615,36 @@ class Gr00tN1d6ActionHead(nn.Module):
                 :, K_all - F :, min(self.mem_varp_view, V - 1)
             ]
         else:
-            # Rolling inference: px holds the CURRENT frame's views. Maintain a detached
-            # F-frame pixel FIFO (episode state, like _vision_cache; cleared by reset_memory).
+            # Rolling inference: full-episode VAR CODE STORE (indices, ~310B/frame — the whole
+            # episode is retainable, so selection is a READ-time replay of the TRAINING keyframe
+            # indexer: frame-0 + top diff peaks + current). Replaces the recent-F pixel FIFO
+            # (112-env-step span, keyframe-vs-recency train/infer mismatch). Each frame is
+            # encoded exactly once; the store rides the policy's `_fs_state` session channel.
+            from gr00t.model.modules.var_pyramid import VarpCodeStore
+
             V = max(1, px.shape[0] // B)
-            cur = px.view(B, V, *px.shape[1:])[:, min(self.mem_varp_view, V - 1)]
-            cur = cur.detach().unsqueeze(1)  # (B, 1, 3, H, W)
-            if self._varp_pixels is None or self._varp_pixels.shape[0] != B:
-                self._varp_pixels = cur.expand(B, F, *cur.shape[2:]).contiguous()
-            elif reset_memory is not None and reset_memory.any():
-                # Per-sample episode reset (mirrors _vision_cache): reset rows refill with the
-                # current frame, others shift.
-                defaults = cur.expand(B, F, *cur.shape[2:])
-                shifted = torch.cat([self._varp_pixels[:, 1:], cur], dim=1)
-                rb = reset_memory.view(B, 1, 1, 1, 1)
-                self._varp_pixels = torch.where(rb, defaults, shifted)
-            else:
-                self._varp_pixels = torch.cat([self._varp_pixels[:, 1:], cur], dim=1)
-            frames = self._varp_pixels
+            cur = px.view(B, V, *px.shape[1:])[:, min(self.mem_varp_view, V - 1)].detach()
+            _, idx = self.var_pyramid.tokenizer(cur, want_idx=True)  # one encode of the new frame
+            if self._fs_state is None or len(self._fs_state) != B:
+                self._fs_state = [None] * B
+            frames_idx = []
+            for b in range(B):
+                st = self._fs_state[b]
+                if not isinstance(st, VarpCodeStore) or (
+                    reset_memory is not None and bool(reset_memory[b])
+                ):
+                    st = VarpCodeStore(self.var_pyramid.patch_nums)
+                    self._fs_state[b] = st
+                st.observe(idx[b], cur[b])
+                frames_idx.append(st.gather(st.select(F)))  # (F, sum p^2) int16
+            idx_BFP = torch.stack(frames_idx).to(cur.device)
+            mem, pos, aux = self.var_pyramid.forward_from_indices(idx_BFP, moment_q_Bd)
+            if self.mem_fs_pos_rope:
+                self._pu_positions = pos
+            if aux is not None:
+                prev = backbone_output.get("mem_aux_loss", None)
+                backbone_output["mem_aux_loss"] = aux if prev is None else prev + aux
+            return mem
         mem, pos, aux = self.var_pyramid(frames, moment_q_Bd)
         if self.mem_fs_pos_rope:
             self._pu_positions = pos
@@ -1513,7 +1525,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         self._vision_cache = None
         self._spatial_cache = None
         self._moment_buffer = None
-        self._varp_pixels = None
+        self._fs_state = None  # per-session selector/code-store objects (policy round-trips)
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """

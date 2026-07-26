@@ -191,13 +191,17 @@ class _VarQuantizerEncodeOnly(nn.Module):
         )
 
     @torch.no_grad()
-    def encode(self, f_BChw: torch.Tensor, patch_nums) -> list[torch.Tensor]:
-        """f: (N, Cvae, G, G) fp32 -> [ (N, p_s^2, Cvae) codebook embeddings ] per scale."""
+    def encode(self, f_BChw: torch.Tensor, patch_nums, want_idx: bool = False):
+        """f: (N, Cvae, G, G) fp32 -> [ (N, p_s^2, Cvae) codebook embeddings ] per scale.
+        want_idx=True additionally returns the per-scale code INDICES concatenated to a single
+        (N, sum p^2) int32 tensor — the lossless minimal storage form (embeddings are a pure
+        codebook lookup away)."""
         N, C, H, W = f_BChw.shape
         assert patch_nums[-1] == H == W, f"patch_nums[-1]={patch_nums[-1]} must equal latent side {H}"
         f_rest = f_BChw.clone()
         SN = len(patch_nums)
         out: list[torch.Tensor] = []
+        idx_parts: list[torch.Tensor] = []
         for si, pn in enumerate(patch_nums):
             z_NC = (
                 F.interpolate(f_rest, size=(pn, pn), mode="area") if si != SN - 1 else f_rest
@@ -207,6 +211,8 @@ class _VarQuantizerEncodeOnly(nn.Module):
             )
             d.addmm_(z_NC, self.embedding.weight.T, alpha=-2, beta=1)
             idx = torch.argmin(d, dim=1).view(N, pn, pn)
+            if want_idx:
+                idx_parts.append(idx.reshape(N, pn * pn).to(torch.int32))
             e = self.embedding(idx)                                   # (N, pn, pn, Cvae)
             out.append(e.reshape(N, pn * pn, C))
             h = e.permute(0, 3, 1, 2)
@@ -214,6 +220,8 @@ class _VarQuantizerEncodeOnly(nn.Module):
                 h = F.interpolate(h, size=(H, W), mode="bicubic")
             h = self.quant_resi[si / (SN - 1)](h.contiguous())
             f_rest.sub_(h)
+        if want_idx:
+            return out, torch.cat(idx_parts, dim=1)
         return out
 
 
@@ -295,10 +303,10 @@ class VarPyramidTokenizer(nn.Module):
         logger.info(f"VarPyramidTokenizer: loaded VAR vae from {path} ({len(sd)} tensors)")
 
     @torch.no_grad()
-    def forward(self, imgs: torch.Tensor) -> list[torch.Tensor]:
+    def forward(self, imgs: torch.Tensor, want_idx: bool = False):
         """imgs: (N, 3, H, W) in [-1, 1] (any H,W; resized to self.res). Returns per-scale
-        (N, p_s^2, Cvae) fp32 embeddings. fp32 + autocast off: frozen VAR is precision-sensitive
-        and cheap relative to the backbone."""
+        (N, p_s^2, Cvae) fp32 embeddings; with want_idx=True, (embs, (N, sum p^2) int32 codes).
+        fp32 + autocast off: frozen VAR is precision-sensitive and cheap vs the backbone."""
         if self._weights_pending:
             raise RuntimeError(
                 "VarPyramidTokenizer: encoding with RANDOM weights — mem_varp_ckpt was set but "
@@ -329,13 +337,33 @@ class VarPyramidTokenizer(nn.Module):
                 self._refresh_fp32_shadow(self)
             from torch.func import functional_call
 
-            return functional_call(self, self._fp32_sd, (imgs,))
+            return functional_call(self, self._fp32_sd, (imgs,), {"want_idx": want_idx})
         with torch.autocast(device_type=imgs.device.type, enabled=False):
             x = imgs.float()
             if x.shape[-2:] != (self.res, self.res):
                 x = F.interpolate(x, size=(self.res, self.res), mode="bicubic", align_corners=False)
             f = self.quant_conv(self.encoder(x))
-            return self.quantize.encode(f, self.patch_nums)
+            return self.quantize.encode(f, self.patch_nums, want_idx=want_idx)
+
+    def _codebook_fp32(self) -> torch.Tensor:
+        """The full-precision codebook, regardless of module casts (bf16 lookups would perturb
+        the stored-code round-trip; the fp32 shadow predates any cast)."""
+        w = self.quantize.embedding.weight
+        if w.dtype != torch.float32:
+            return self._fp32_sd["quantize.embedding.weight"].to(w.device)
+        return w
+
+    @torch.no_grad()
+    def indices_to_embs(self, idx_NP: torch.Tensor) -> list[torch.Tensor]:
+        """Inverse of the storage form: (N, sum p^2) int codes -> per-scale (N, p^2, Cvae)
+        fp32 embeddings, bit-equal to what forward() would emit for the same frames."""
+        book = self._codebook_fp32()
+        out, off = [], 0
+        for p in self.patch_nums:
+            n = p * p
+            out.append(F.embedding(idx_NP[:, off : off + n].long(), book))
+            off += n
+        return out
 
 
 # ---------------------------------------------------------------------------- trainable side
@@ -411,6 +439,56 @@ class CoarsenessSelector(nn.Module):
         h = h + self.fa_o(attn.to(wd) @ v)
         logits = self.mlp(h).float() / self.temp             # (B, F, S)
         return torch.sigmoid(logits).cumprod(dim=-1)         # nested prefix gates, fp32
+
+
+class VarpCodeStore:
+    """Full-episode per-session store of VAR code INDICES (~2 bytes x 155/frame at res128).
+
+    Storing codes instead of pixels makes retention trivial — the whole episode fits in ~10s of
+    KB — so frame selection becomes a READ-time decision that replays the TRAINING keyframe
+    indexer (`_fs_diff_indices`: frame-0 + top pixel-diff peaks <= anchor + anchor) EXACTLY,
+    instead of the recency-FIFO's 112-step bound and greedy approximations. Each frame is
+    VAR-encoded exactly once (at observe); reads are index gathers + codebook lookups.
+
+    Plain CPU object: round-trips per session through the policy's `_fs_state` channel like
+    DiffFrameSelector/PatchUnionSelector; a reset slot arrives as None -> fresh store.
+    """
+
+    def __init__(self, patch_nums, sig_side: int = 32):
+        self.patch_nums = tuple(patch_nums)
+        self.sig_side = int(sig_side)
+        self.codes: list[torch.Tensor] = []   # per call: (sum p^2,) int16 CPU
+        self.scores: list[float] = []         # pixel-diff vs previous call (frame-0 = inf)
+        self.last_sig: torch.Tensor | None = None
+        self.t = -1
+
+    def observe(self, idx_P: torch.Tensor, frame_3HW: torch.Tensor) -> None:
+        """Advance one policy call: store this frame's codes + its novelty score. The score is
+        computed on a small pixel signature (area-pooled), mirroring the training scorer's
+        pixel-diff up to resolution; only the PREVIOUS signature is retained, never frames."""
+        self.t += 1
+        sig = F.interpolate(
+            frame_3HW.detach().float().unsqueeze(0), size=(self.sig_side, self.sig_side),
+            mode="area",
+        )[0].cpu()
+        self.scores.append(
+            float("inf") if self.last_sig is None else float((sig - self.last_sig).abs().mean())
+        )
+        self.last_sig = sig
+        self.codes.append(idx_P.detach().to(torch.int16).cpu())
+
+    def select(self, n_frames: int) -> list[int]:
+        """Replay the training keyframe indexer over the full stored history."""
+        import numpy as np
+
+        from gr00t.data.dataset.sharded_single_step_dataset import _fs_diff_indices
+
+        steps = np.arange(self.t + 1)
+        scores = np.array(self.scores, dtype=np.float64)
+        return _fs_diff_indices(steps, scores, anchor=self.t, fs_frames=n_frames)
+
+    def gather(self, sel: list[int]) -> torch.Tensor:
+        return torch.stack([self.codes[i] for i in sel])  # (F, sum p^2) int16 CPU
 
 
 class VarPyramidMemory(nn.Module):
@@ -529,7 +607,23 @@ class VarPyramidMemory(nn.Module):
         B, Fn, _, H, W = frames_BF3HW.shape
         assert Fn <= self.age_emb.shape[0], f"F={Fn} exceeds max_frames={self.age_emb.shape[0]}"
         embs = self.tokenizer(frames_BF3HW.reshape(B * Fn, 3, H, W))  # [(B*F, p^2, Cvae)] fp32
+        return self._forward_embs(embs, query_Bd, B, Fn)
 
+    def forward_from_indices(
+        self, idx_BFP: torch.Tensor, query_Bd: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Code-native read path: (B, F, sum p^2) int code indices -> the SAME outputs as
+        forward() would produce for the frames those codes came from (codebook lookup is
+        bit-exact) — the action head reads VAR codes, so storing indices is lossless."""
+        B, Fn, P = idx_BFP.shape
+        assert P == self.tokens_per_frame, f"expected {self.tokens_per_frame} codes/frame, got {P}"
+        assert Fn <= self.age_emb.shape[0], f"F={Fn} exceeds max_frames={self.age_emb.shape[0]}"
+        embs = self.tokenizer.indices_to_embs(idx_BFP.reshape(B * Fn, P))
+        return self._forward_embs(embs, query_Bd, B, Fn)
+
+    def _forward_embs(
+        self, embs: list[torch.Tensor], query_Bd: torch.Tensor, B: int, Fn: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         gist = self._gist(embs, B, Fn)
         z = self.selector(query_Bd, gist)                                  # (B, F, S) fp32
         if self.gate_hard:
@@ -550,7 +644,7 @@ class VarPyramidMemory(nn.Module):
         mem = tok * gate.unsqueeze(-1).to(dt)
 
         # positions (dt, y, x): dt = recency rank (0 = most recent, matches fs_pos_rope).
-        dev = frames_BF3HW.device
+        dev = embs[0].device
         age = torch.arange(Fn - 1, -1, -1, device=dev, dtype=torch.float32)          # (F,)
         pos = torch.stack(
             [

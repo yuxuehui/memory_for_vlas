@@ -439,7 +439,7 @@ class Gr00tPolicy(BasePolicy):
             # list, not a stacked tensor). Reset slots get None -> the model creates a
             # fresh selector; liveness/effective_reset still keys off the FIFO caches,
             # which keep updating unconditionally in diff mode.
-            if getattr(ah, "mem_fs_select", "fifo") in ("diff", "patch_union"):
+            if getattr(ah, "mem_fs_select", "fifo") in ("diff", "patch_union", "var_pyramid"):
                 ah._fs_state = [
                     None if reset_memory_flags[i] else self._fs_session_state.get(session_ids[i])
                     for i in range(B)
