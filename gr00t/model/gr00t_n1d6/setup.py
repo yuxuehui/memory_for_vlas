@@ -88,6 +88,9 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 "mem_fs_inject", "mem_film_layers", "mem_source", "mem_framesamp_budget",
                 "mem_framesamp_frames", "mem_fs_select", "mem_fs_diff_stride",
                 "mem_fs_attn_layer", "mem_fs_diff_share", "mem_fs_tail_share", "mem_fs_pos_rope",
+                "mem_varp_ckpt", "mem_varp_res", "mem_varp_budget", "mem_varp_gate_hard",
+                "mem_varp_budget_lambda", "mem_varp_target_frac", "mem_varp_gist_scales",
+                "mem_varp_view",
                 "mem_image_side", "freeze_moment_tokens",
                 "memory_type", "tcl_tau", "tcl_no_projection_head", "mem_window_mode",
                 "memory_arch", "memory_hidden", "memory_state_dim",
@@ -134,6 +137,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 "spatial_cross_attn",  # dual: h_spatial cross-attn (absent from a moment ckpt)
                 "norm_spatial",
                 "fs_inject",  # v2b: framesamp-injection modules (absent from base/dual ckpts)
+                "var_pyramid",  # VAR-pyramid memory (frozen vae + selector; absent from base ckpts)
             )
 
             def _is_tolerated(k: str) -> bool:
@@ -225,6 +229,16 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                                     _mod.weight.data.fill_(1.0)
                                 if getattr(_mod, "bias", None) is not None:
                                     _mod.bias.data.zero_()
+                    if (
+                        getattr(model.action_head, "var_pyramid", None) is not None
+                        and any("var_pyramid" in k for k in tolerated_missing)
+                    ):
+                        # var_pyramid keys missing from the ckpt: re-init the trainable side and
+                        # RE-LOAD the frozen VAR vae — fast-init may have left ALL of them
+                        # (including the frozen 44M vae) as torch.empty garbage.
+                        model.action_head.var_pyramid.reinit_missing_from_ckpt(
+                            str(getattr(self.config.model, "mem_varp_ckpt", "") or "")
+                        )
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])

@@ -132,6 +132,17 @@ if __name__ == "__main__":
     config.model.mem_fs_diff_share = ft_config.mem_fs_diff_share
     config.model.mem_fs_tail_share = ft_config.mem_fs_tail_share
     config.model.mem_fs_pos_rope = ft_config.mem_fs_pos_rope
+    # VAR-pyramid multi-coarseness memory (mem_fs_select='var_pyramid'): stamp all knobs onto
+    # the model config so the action head AND the saved checkpoint see them (getattr defaults
+    # would otherwise silently train with RANDOM VAR weights).
+    config.model.mem_varp_ckpt = ft_config.mem_varp_ckpt
+    config.model.mem_varp_res = ft_config.mem_varp_res
+    config.model.mem_varp_budget = ft_config.mem_varp_budget
+    config.model.mem_varp_gate_hard = ft_config.mem_varp_gate_hard
+    config.model.mem_varp_budget_lambda = ft_config.mem_varp_budget_lambda
+    config.model.mem_varp_target_frac = ft_config.mem_varp_target_frac
+    config.model.mem_varp_gist_scales = ft_config.mem_varp_gist_scales
+    config.model.mem_varp_view = ft_config.mem_varp_view
     config.model.mem_image_side = ft_config.mem_image_side
     config.model.mem_window_mode = ft_config.mem_window_mode
     if (
@@ -183,6 +194,10 @@ if __name__ == "__main__":
                 MODALITY_CONFIGS[tag]["video"].framesamp_select = {
                     "diff": "diff",
                     "patch_union": "patch_union",
+                    # var_pyramid: CAUSAL diff-keyframes incl. the anchor as last frame —
+                    # matches its inference pixel FIFO (write-then-read, current frame in
+                    # memory). Acausal linspace here was the patch_union-v1 root cause.
+                    "var_pyramid": "diff",
                 }.get(ft_config.mem_fs_select, "linspace")
                 MODALITY_CONFIGS[tag]["video"].framesamp_diff_stride = (
                     ft_config.mem_fs_diff_stride

@@ -96,6 +96,37 @@ class Gr00tN1d6ActionHead(nn.Module):
         self.mem_fs_pos_rope = bool(getattr(config, "mem_fs_pos_rope", False))
         self._pu_rope_hd = int(config.diffusion_model_cfg.get("attention_head_dim", 48))
         self._pu_positions = None  # (B, M, 3) Δt,y,x of the current mem_seq, for key RoPE
+        # mem_fs_select='var_pyramid' (Markdown/var_pyramid_memory.md): frozen VAR multi-scale
+        # VQVAE encodes each candidate frame's RAW pixels into a residual coarseness pyramid;
+        # a trainable selector picks the stored prefix depth per frame, conditioned on the
+        # task/observation query. mem_seq = gated pyramid tokens; positions ride the same
+        # fs_pos_rope channel as patch_union; the budget aux loss rides mem_aux_loss.
+        self.var_pyramid = None
+        if self.mem_fs_select == "var_pyramid":
+            assert (
+                self.mem_source == "framesamp"
+                and getattr(config, "mem_cond_type", "cross_attn") in ("modul", "cross_attn")
+                and int(getattr(config, "mem_framesamp_frames", 0)) > 0
+            ), (
+                "mem_fs_select='var_pyramid' requires mem_source='framesamp', mem_cond_type in "
+                "('modul','cross_attn') and mem_framesamp_frames>0 — otherwise the selector/proj "
+                "params are never exercised (DDP unused-parameter crash) and no memory is built."
+            )
+            from gr00t.model.modules.var_pyramid import VarPyramidMemory
+
+            self.var_pyramid = VarPyramidMemory(
+                dim=config.backbone_embedding_dim,
+                res=int(getattr(config, "mem_varp_res", 128)),
+                max_frames=max(32, int(getattr(config, "mem_framesamp_frames", 0)) + 1),
+                budget=int(getattr(config, "mem_varp_budget", 0)),
+                gate_hard=bool(getattr(config, "mem_varp_gate_hard", False)),
+                budget_lambda=float(getattr(config, "mem_varp_budget_lambda", 0.0)),
+                target_frac=float(getattr(config, "mem_varp_target_frac", 0.0)),
+                gist_scales=int(getattr(config, "mem_varp_gist_scales", 4)),
+                var_ckpt=str(getattr(config, "mem_varp_ckpt", "")),
+            )
+            self.mem_varp_view = int(getattr(config, "mem_varp_view", 0))
+        self._varp_pixels = None  # rolling-inference pixel FIFO (B, F, 3, H, W), detached
         # Per-session selector list at inference (DiffFrameSelector | PatchUnionSelector);
         # Gr00tPolicy round-trips it across calls exactly like the FIFO caches.
         self._fs_state: list | None = None
@@ -532,6 +563,83 @@ class Gr00tN1d6ActionHead(nn.Module):
             self._pu_positions = positions_from_flat(keep_idx, n_img)
         return torch.gather(flat_all, 1, keep_idx.unsqueeze(-1).expand(B, budget, d)).contiguous()
 
+    def _var_pyramid_mem_seq(
+        self,
+        backbone_output,
+        B: int,
+        K_all: int,
+        F: int,
+        moment_q_Bd: torch.Tensor,
+        reset_memory: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """mem_fs_select='var_pyramid': encode the F candidate frames' RAW pixels
+        (`fs_pixels`, stashed by the top-level forward/get_action) with the frozen VAR pyramid
+        and emit the selector-gated multi-coarseness tokens as mem_seq. Returns None when
+        pixels/config are unavailable — the caller falls back to _framesamp_mem_seq.
+        Positions ride self._pu_positions (fs_pos_rope key-RoPE, same channel as patch_union);
+        the expected-budget aux loss rides backbone_output['mem_aux_loss'] (same plumbing as
+        the multi-scale V2 aux; framesamp excludes the moment-path writers, so no collision)."""
+        px = backbone_output.get("fs_pixels", None)
+        if px is None or self.var_pyramid is None or F <= 0:
+            if self.mem_fs_pos_rope:
+                # Never leave positions from a previous successful call: the caller falls back
+                # to framesamp tokens of a DIFFERENT length, and stale positions would rotate
+                # the wrong keys (or crash) in the DiT key-RoPE.
+                self._pu_positions = None
+            return None
+        if isinstance(px, (list, tuple)):
+            # Eagle processor emits pixel_values as a LIST of per-image tensors (tiles, 3, H, W)
+            # in row-major image order. RoboMME 256px -> 1 tile of 252x252 each, so the cat
+            # reproduces the (B*K_all*V, 3, H, W) layout. Heterogeneous sizes (dynamic tiling
+            # on larger images) are resized to the VAR encode res first — VAR resizes anyway.
+            res = self.var_pyramid.tokenizer.res
+            if len({tuple(t.shape[-2:]) for t in px}) > 1:
+                px = [
+                    torch.nn.functional.interpolate(
+                        t.float(), size=(res, res), mode="bicubic", align_corners=False
+                    )
+                    for t in px
+                ]
+            px = torch.cat([t.reshape(-1, *t.shape[-3:]) for t in px], dim=0)
+        rows = B * K_all
+        if K_all > 1:
+            # K-step training: pixel rows cover all K_target+F backbone rows (V views each,
+            # row-major). Slice the LAST F rows (the episode-spanning candidates), chosen view.
+            if px.shape[0] % rows != 0:
+                raise RuntimeError(
+                    f"var_pyramid: fs_pixels has {px.shape[0]} rows, not divisible by "
+                    f"B*K_all={rows} — unexpected pixel_values layout (views per row must be "
+                    f"constant and row-major)."
+                )
+            V = px.shape[0] // rows
+            frames = px.view(B, K_all, V, *px.shape[1:])[
+                :, K_all - F :, min(self.mem_varp_view, V - 1)
+            ]
+        else:
+            # Rolling inference: px holds the CURRENT frame's views. Maintain a detached
+            # F-frame pixel FIFO (episode state, like _vision_cache; cleared by reset_memory).
+            V = max(1, px.shape[0] // B)
+            cur = px.view(B, V, *px.shape[1:])[:, min(self.mem_varp_view, V - 1)]
+            cur = cur.detach().unsqueeze(1)  # (B, 1, 3, H, W)
+            if self._varp_pixels is None or self._varp_pixels.shape[0] != B:
+                self._varp_pixels = cur.expand(B, F, *cur.shape[2:]).contiguous()
+            elif reset_memory is not None and reset_memory.any():
+                # Per-sample episode reset (mirrors _vision_cache): reset rows refill with the
+                # current frame, others shift.
+                defaults = cur.expand(B, F, *cur.shape[2:])
+                shifted = torch.cat([self._varp_pixels[:, 1:], cur], dim=1)
+                rb = reset_memory.view(B, 1, 1, 1, 1)
+                self._varp_pixels = torch.where(rb, defaults, shifted)
+            else:
+                self._varp_pixels = torch.cat([self._varp_pixels[:, 1:], cur], dim=1)
+            frames = self._varp_pixels
+        mem, pos, aux = self.var_pyramid(frames, moment_q_Bd)
+        if self.mem_fs_pos_rope:
+            self._pu_positions = pos
+        if aux is not None:
+            prev = backbone_output.get("mem_aux_loss", None)
+            backbone_output["mem_aux_loss"] = aux if prev is None else prev + aux
+        return mem
 
     def _pu_rope_on(self):
         """Build cos/sin from self._pu_positions and arm the key-RoPE for the next DiT forward.
@@ -891,16 +999,23 @@ class Gr00tN1d6ActionHead(nn.Module):
                         # (linspace sub-sampled) instead of moment tokens. With episode-spanning
                         # frames available (F>0) they span the WHOLE episode; otherwise fall back
                         # to the K-window frames (and finally moment tokens if no image tokens).
-                        if fs_backbone is not None:
+                        _mq = backbone_features.view(B, K, T, d)[:, -1, -n_q:, :].mean(1)
+                        fs = None
+                        if self.mem_fs_select == "var_pyramid":
+                            fs = self._var_pyramid_mem_seq(
+                                backbone_output,
+                                B,
+                                K_target + F if fs_backbone is not None else K,
+                                F if fs_backbone is not None else self.mem_framesamp_frames,
+                                _mq,
+                            )
+                        if fs is None and fs_backbone is not None:
                             fs = (
-                                self._patch_union_mem_seq(
-                                    fs_backbone, fs_image_mask,
-                                    backbone_features.view(B, K, T, d)[:, -1, -n_q:, :].mean(1),
-                                )
+                                self._patch_union_mem_seq(fs_backbone, fs_image_mask, _mq)
                                 if self.mem_fs_select == "patch_union"
                                 else self._framesamp_mem_seq(fs_backbone, fs_image_mask)
                             )
-                        else:
+                        elif fs is None:
                             im_full = (
                                 backbone_output["image_mask"].view(B, K, -1)
                                 if "image_mask" in backbone_output
@@ -922,16 +1037,23 @@ class Gr00tN1d6ActionHead(nn.Module):
                     # (linspace sub-sampled to <=budget) replace the n_q moment-token tail in the
                     # action-head KV, so the DiT cross-attends [image | text | framesamp(<=budget)]
                     # through the existing cross_attn routing — NO moment-token compression.
-                    if fs_backbone is not None:
+                    _mq = backbone_features.view(B, K, T, d)[:, -1, -n_q:, :].mean(1)
+                    fs = None
+                    if self.mem_fs_select == "var_pyramid":
+                        fs = self._var_pyramid_mem_seq(
+                            backbone_output,
+                            B,
+                            K_target + F if fs_backbone is not None else K,
+                            F if fs_backbone is not None else self.mem_framesamp_frames,
+                            _mq,
+                        )
+                    if fs is None and fs_backbone is not None:
                         fs = (
-                            self._patch_union_mem_seq(
-                                fs_backbone, fs_image_mask,
-                                backbone_features.view(B, K, T, d)[:, -1, -n_q:, :].mean(1),
-                            )
+                            self._patch_union_mem_seq(fs_backbone, fs_image_mask, _mq)
                             if self.mem_fs_select == "patch_union"
                             else self._framesamp_mem_seq(fs_backbone, fs_image_mask)
                         )
-                    else:
+                    elif fs is None:
                         im_full = (
                             backbone_output["image_mask"].view(B, K, -1)
                             if "image_mask" in backbone_output
@@ -1110,7 +1232,25 @@ class Gr00tN1d6ActionHead(nn.Module):
                         # The FIFO update above still runs unconditionally — it remains the
                         # per-session liveness/round-trip anchor in Gr00tPolicy, so the
                         # default path stays byte-identical and reset semantics are shared.
-                        if self.mem_fs_select == "patch_union":
+                        _vp_used = False
+                        if self.mem_fs_select == "var_pyramid":
+                            # VAR-pyramid memory, INFERENCE: read the rolling pixel FIFO
+                            # (updated inside the helper; per-sample reset honored). Falls back
+                            # to the raw-vision FIFO if fs_pixels is missing. The generic
+                            # linspace->budget trim below is SKIPPED for pyramid tokens — the
+                            # selector gates / mem_varp_budget govern their count, and an even
+                            # trim would desync self._pu_positions from the kept tokens.
+                            fs_vp = self._var_pyramid_mem_seq(
+                                backbone_output, B, 1, F,
+                                backbone_features[:, -n_q:, :].mean(1),
+                                reset_memory=reset_memory,
+                            )
+                            if fs_vp is not None:
+                                vis = fs_vp
+                                _vp_used = True
+                            else:
+                                vis = self._vision_cache
+                        elif self.mem_fs_select == "patch_union":
                             # Patch-level union memory, INFERENCE. READ the heap now (memory at
                             # step t = history < t); the current frame's patches are SCORED by
                             # the same quantity training uses — the DiT's action->patch
@@ -1198,7 +1338,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                             vis = self._vision_cache
                         n_tok = vis.shape[1]
                         budget = min(self.mem_framesamp_budget, n_tok)
-                        if budget < n_tok:
+                        if budget < n_tok and not _vp_used:
                             sel = torch.linspace(
                                 0, n_tok - 1, steps=budget, device=vis.device
                             ).round().long()
@@ -1373,6 +1513,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         self._vision_cache = None
         self._spatial_cache = None
         self._moment_buffer = None
+        self._varp_pixels = None
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -1835,6 +1976,12 @@ class Gr00tN1d6(PreTrainedModel):
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
+        if (
+            getattr(self.action_head, "mem_fs_select", "fifo") == "var_pyramid"
+            and "pixel_values" in backbone_inputs
+        ):
+            # Raw pixels ([-1,1], Eagle-normalized) for the frozen VAR pyramid tokenizer.
+            backbone_outputs["fs_pixels"] = backbone_inputs["pixel_values"]
         action_outputs = self.action_head(backbone_outputs, action_inputs)
 
         return action_outputs
@@ -1874,7 +2021,8 @@ class Gr00tN1d6(PreTrainedModel):
         # Forward through backbone
         backbone_outputs = self.backbone(backbone_inputs)
         if (
-            getattr(self.action_head, "mem_fs_select", "fifo") in ("diff", "patch_union")
+            getattr(self.action_head, "mem_fs_select", "fifo")
+            in ("diff", "patch_union", "var_pyramid")
             and "pixel_values" in backbone_inputs
         ):
             # Raw pixels for the diff-keyframe write score (fs_diff_select). Score-only:

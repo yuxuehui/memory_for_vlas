@@ -13,11 +13,12 @@ read-out) overall success on RoboMME. But no single memory wins everywhere — t
 the *task semantics* (counting vs. occlusion vs. trajectory imitation), which is the main empirical result
 of this repo ([§5b](#5b-keyframe-selection-ab-all-60k-16-tasks--50-eps--800-episodes-each)).
 
-**Methods at a glance** — five trained arms, all from one codebase, selected by config flags
+**Methods at a glance** — six trained arms, all from one codebase, selected by config flags
 ([§0](#0-method-index-quick-reference)): `vanilla` · `HAMLET` read-out (compressed) ·
 **keyframe selection** in three flavors — `FrameSamp` (uniform) → `TokenDrop` (observation change) →
 `Action-conditioned patch memory` (novelty ∪ action-relevance) · `Multi-resolution memory` (read-out fused
-into image tokens).
+into image tokens) · `VAR-pyramid memory` (multi-coarseness storage: frozen VAR residual pyramid +
+task-conditioned depth selection).
 
 This README catalogs every method and gives a verified, copy-paste command for each. Architecture detail lives in the code (pointers in [Code map](#code-map)).
 
@@ -40,6 +41,7 @@ codebase** — a method is a combination of config flags, not a branch.
 | **framesamp（均匀关键帧）** | `--mem-source framesamp --mem-fs-select fifo` | `gr00t_n1d6.py::_framesamp_mem_seq` + loader linspace |
 | **tokendrop（diff 关键帧）** | `--mem-source framesamp --mem-fs-select diff` | `modules/fs_diff_select.py` + loader `_fs_diff_scores` / `_fs_diff_indices` |
 | **Action-conditioned patch memory（patch_union）** | `--mem-source framesamp --mem-fs-select patch_union` | `modules/fs_patch_union.py` + `gr00t_n1d6.py::_patch_union_mem_seq` / `_patch_union_score_pass` / `_pu_commit` |
+| **VAR-pyramid memory（多粒度存储 + 任务条件深度选择）** | `--mem-source framesamp --mem-fs-select var_pyramid --mem-varp-ckpt <vae>` | `modules/var_pyramid.py`（frozen VAR vae + `CoarsenessSelector`）+ `gr00t_n1d6.py::_var_pyramid_mem_seq` |
 
 `--mem-fs-select` 只在 `--mem-source framesamp` 下生效，它决定 **哪些帧/patch 进入 memory**（选择规则），
 与 `--mem-cond-type`（记忆怎么注入 DiT）正交。
@@ -301,6 +303,41 @@ Both round-trip through the ckpt config; on an old ckpt override at eval with
 `modules/fs_pos_rope.py` (3D RoPE math), rotation folded into `modules/fs_patch_union.py`'s
 sdpa patch (rotates only the memory-tail keys of a cross-attn; self-attn untouched).
 
+### Method 6 — VAR-pyramid memory (multi-coarseness storage + task-conditioned depth selection)
+
+Changes **what is stored per frame**, not which frames: each candidate frame is encoded by a
+**frozen VAR multi-scale VQVAE** (FoundationVision, NeurIPS'24) into a **residual pyramid** —
+scale *s* quantizes what scales 1..s−1 missed, so depth = rate and each deeper scale adds only new
+information. A small trainable selector (~0.9M) allocates per-frame storage **depth** via nested
+prefix gates, conditioned on the moment-token query + a per-frame gist, with a cross-frame
+attention layer and a token-budget penalty anchored at the hard cap's operating point. Stored
+tokens carry (Δt, y, x) through the same key-RoPE channel as patch_union.
+
+```bash
+# once: the official VAR vae checkpoint (~440MB)
+huggingface-cli download FoundationVision/var vae_ch160v4096z32.pth --local-dir ckpts/
+
+torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune.py \
+  --base-model-path nvidia/GR00T-N1.6-3B --dataset-path "$DATASET_PATH" --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path gr00t/configs/data/robomme_config.py --num-gpus 4 --global-batch-size 32 \
+  --hamlet-mode finetune --learning-rate 1e-4 --max-grad-norm 1.0 --tune-top-llm-layers 4 \
+  --n-moment-tokens 4 --memory-window 8 --memory-stride 16 --memory-num-layers 2 \
+  --memory-type moment_token --no-freeze-moment-tokens \
+  --max-steps 60000 --save-steps 10000 --save-total-limit 10 --output-dir runs/robomme/var_pyramid \
+  --mem-cond-type cross_attn --mem-source framesamp --mem-framesamp-frames 8 --mem-framesamp-budget 512 \
+  --mem-fs-select var_pyramid --mem-varp-ckpt ckpts/vae_ch160v4096z32.pth \
+  --mem-varp-res 128 --mem-varp-budget 512 --mem-varp-budget-lambda 0.05 --mem-fs-pos-rope
+```
+
+Notes: `--mem-varp-budget 512` = matched budget with the framesamp/tokendrop/patch_union arms.
+The loader maps `var_pyramid` to **causal** diff-keyframes (same lesson as tokendrop). `res 128`
+is the right fixed-budget default (matched 155-token budget: res128 full-depth beats res256
+truncated); switch `--mem-varp-res 256` only if eval shows small-object color-identity errors.
+Single-GPU 30-step smoke: `run_scripts/smoke_var_pyramid.sh`. Diagnostics for the selector:
+watch the per-frame gate heatmap for differentiation; check the entropy of `selector.last_attn`
+(uniform = the cross-frame layer is connected but not reasoning); raising the budget λ under the
+hard cap only flattens gates further.
+
 ### Evaluation (RoboMME rollout)
 
 ```bash
@@ -468,6 +505,7 @@ Per-task winners: HAMLET 10 · FrameSamp 5 · TokenDrop 2 · vanilla 1 (ties cou
 | Multi-scale memory bank (note 10) | `gr00t/model/modules/multiscale_memory.py` |
 | **Keyframe selection — diff (tokendrop)** | `gr00t/model/modules/fs_diff_select.py` (`DiffFrameSelector`, eval) + `gr00t/data/dataset/sharded_single_step_dataset.py` (`_fs_diff_scores`/`_fs_diff_indices`, train) |
 | **Patch-level selection — patch_union** | `gr00t/model/modules/fs_patch_union.py` (`PatchUnionSelector` + sdpa attn capture) + `gr00t_n1d6.py` (`_patch_union_mem_seq`, `_patch_union_score_pass`, `_pu_commit`) |
+| **Multi-coarseness storage — var_pyramid** | `gr00t/model/modules/var_pyramid.py` (frozen VAR vae vendor + `CoarsenessSelector` + budget aux) + `gr00t_n1d6.py` (`_var_pyramid_mem_seq`) |
 | Per-session selector state round-trip (eval) | `gr00t/policy/gr00t_policy.py` (`_fs_session_state`) |
 | Eval-time selection override | `gr00t/eval/run_gr00t_server.py` (`--mem-fs-select`, `--mem-fs-attn-layer`) |
 | Train entry / loader window+framesamp logic | `gr00t/experiment/launch_finetune.py`, `gr00t/experiment/experiment.py` |

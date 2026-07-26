@@ -285,7 +285,7 @@ class FinetuneConfig:
     cross-attention (even `linspace` sub-sample of the available per-frame patch tokens).
     MME-VLA reference uses up to 512."""
 
-    mem_fs_select: Literal["fifo", "diff", "patch_union"] = "fifo"
+    mem_fs_select: Literal["fifo", "diff", "patch_union", "var_pyramid"] = "fifo"
     """`mem_source='framesamp'` frame-selection FAMILY. "fifo" (default) = current
     behavior: acausal whole-episode linspace frames at train, recent-F FIFO at inference.
     "diff" = TokenDrop-style pixel-difference keyframes at BOTH train (loader: causal
@@ -310,7 +310,45 @@ class FinetuneConfig:
 
     mem_fs_pos_rope: bool = False
     """mem_fs_select='patch_union': PPE-style 3D RoPE (Δt,y,x) on the stored memory keys in the
-    DiT cross-attention (note-23). False = no position (default, backward-compatible)."""
+    DiT cross-attention (note-23). False = no position (default, backward-compatible).
+    Also honored by mem_fs_select='var_pyramid' (pyramid-token centers on the latent grid)."""
+
+    mem_varp_ckpt: str = ""
+    """mem_fs_select='var_pyramid': path to the official VAR vae checkpoint
+    (vae_ch160v4096z32.pth, https://huggingface.co/FoundationVision/var). REQUIRED for real
+    training — '' builds a random-weight tokenizer (tests only, warns loudly)."""
+
+    mem_varp_res: int = 128
+    """mem_fs_select='var_pyramid': VAR encode resolution. 128 -> latent 8x8, scales
+    (1,2,3,4,5,6,8), <=155 tokens/frame; 256 -> latent 16x16, full 10 scales, <=680/frame."""
+
+    mem_varp_budget: int = 0
+    """mem_fs_select='var_pyramid': hard cap on emitted memory tokens (top-budget by gate,
+    temporal order kept). 0 = no cap (soft gating only). For matched-budget A/B against
+    patch_union/tokendrop set this equal to mem_framesamp_budget."""
+
+    mem_varp_gate_hard: bool = False
+    """mem_fs_select='var_pyramid': straight-through 0/1 prefix gates (hard forward, soft
+    backward) instead of soft gate scaling — train/deploy-consistent hard selection."""
+
+    mem_varp_budget_lambda: float = 0.0
+    """mem_fs_select='var_pyramid': weight of the expected-token-fraction penalty on the
+    selector gates (pressure to store coarser unless the task needs detail). 0 = off."""
+
+    mem_varp_target_frac: float = 0.0
+    """mem_fs_select='var_pyramid': explicit target for the (frac - target)^2 budget penalty.
+    0 = AUTO: with a hard mem_varp_budget the target anchors at budget/(F*tokens_per_frame)
+    (the cap's operating point — a plain linear penalty would push the capped-out deep gates
+    to zero unopposed); without a hard budget, 0 falls back to the linear rate penalty."""
+
+    mem_varp_gist_scales: int = 4
+    """mem_fs_select='var_pyramid': number of coarsest pyramid levels pooled (mean + channel-max
+    per level) into the selector's per-frame gist. Must reach deep enough to SEE what the
+    selector is asked to buy — object identity enters the code around mid-depth."""
+
+    mem_varp_view: int = 0
+    """mem_fs_select='var_pyramid': which camera view's pixels feed the VAR tokenizer
+    (0 = primary/front). Wrist-view folding into pos-RoPE is future work."""
 
     mem_framesamp_frames: int = 8
     """`mem_source='framesamp'` only — number of EPISODE-SPANNING video frames the loader
