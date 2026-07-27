@@ -37,11 +37,27 @@ if [ ! -d repo/.git ]; then git clone --depth 1 "$REPO_URL" repo; else git -C re
 if [ ! -x venv/bin/python ]; then python3 -m venv venv; fi
 source venv/bin/activate
 pip -q install -U pip wheel setuptools
-python -c "import torch" 2>/dev/null || pip -q install torch==2.7.1 torchvision==0.22.1
+# torch 2.7.1 wheels exist for cu118/cu126/cu128; pick the one matching the image's toolkit so
+# flash-attn's source build (nvcc from CUDA_HOME) links against a compatible runtime.
+if ! python -c "import torch" 2>/dev/null; then
+  NVCC_VER=$(nvcc --version 2>/dev/null | grep -oE "release [0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+  case "$NVCC_VER" in
+    12.6|12.7) IDX=cu126 ;;
+    12.8|12.9|13.*|"") IDX=cu128 ;;
+    *) IDX=cu126 ;;
+  esac
+  echo "== nvcc ${NVCC_VER:-unknown} -> installing torch 2.7.1+$IDX"
+  pip -q install torch==2.7.1 torchvision==0.22.1 --index-url "https://download.pytorch.org/whl/$IDX"
+fi
 python -c "import gr00t, flash_attn" 2>/dev/null || {
   echo "== installing repo deps (flash-attn builds from source, ~15 min)"
   ( cd repo && MAX_JOBS="${MAX_JOBS:-16}" pip -q install -e . ) || \
-  ( cd repo && MAX_JOBS="${MAX_JOBS:-16}" pip -q install flash-attn==2.7.4.post1 --no-build-isolation && pip -q install -e . ); }
+  ( cd repo && MAX_JOBS="${MAX_JOBS:-16}" pip -q install flash-attn==2.7.4.post1 --no-build-isolation \
+      && pip -q install -e . --no-build-isolation ) || {
+    echo "ERROR: flash-attn failed to build. Most likely the image's CUDA toolkit is too new for"
+    echo "       flash-attn 2.7.4 (CUDA 13 images are the usual cause). Recreate the instance on a"
+    echo "       CUDA 12.6/12.8 image, or set CUDA_HOME to a 12.x toolkit and re-run this script."
+    nvcc --version 2>/dev/null | tail -2; exit 1; }; }
 
 # ---- 3) dataset (121G) + authored meta ----------------------------------------------------
 DATA="${DATA:-$WORK/robomme}"
