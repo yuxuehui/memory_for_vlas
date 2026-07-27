@@ -15,7 +15,13 @@ DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to the RoboMME dataset dir (meta/
 OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/var_pyramid}"
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 VAE_CKPT="${VAE_CKPT:-ckpts/vae_ch160v4096z32.pth}"
-NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L | wc -l)}"
+# Respect CUDA_VISIBLE_DEVICES — on a SHARED dev box only some GPUs are ours, and counting
+# physical cards would launch ranks onto other people's work.
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  NUM_GPUS="${NUM_GPUS:-$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)}"
+else
+  NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L | wc -l)}"
+fi
 PER_DEVICE="${PER_DEVICE:-2}"                       # 80G card; 40G cards need 1
 MAX_STEPS="${MAX_STEPS:-60000}"
 SAVE_STEPS="${SAVE_STEPS:-2500}"
