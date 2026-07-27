@@ -62,8 +62,17 @@ fetch_code() {
         && rm -f /tmp/varp_code.tgz && return 0
     fi
   done
-  echo "== tarball routes failed; falling back to git clone (may be slow)"
-  rm -rf repo && git clone --depth 1 "$REPO_URL" repo
+  # Last resort: git. Two hardenings for the Beijing instances — HTTP/1.1 (the observed failure
+  # is the classic "HTTP/2 stream 0 was not closed cleanly: CANCEL") and a sparse checkout that
+  # skips docs/ (~20 MB of analysis PNGs, i.e. most of the repo, none of it needed to train).
+  echo "== tarball routes failed; git clone over HTTP/1.1, sparse (no docs/)"
+  local GITC=(-c http.version=HTTP/1.1 -c http.postBuffer=524288000 -c core.compression=0)
+  rm -rf repo
+  if git "${GITC[@]}" clone --depth 1 --filter=blob:none --sparse "$REPO_URL" repo; then
+    git -C repo sparse-checkout set --no-cone '/*' '!/docs' || git -C repo sparse-checkout disable
+  else
+    rm -rf repo && git "${GITC[@]}" clone --depth 1 "$REPO_URL" repo
+  fi
 }
 if [ -d repo/.git ]; then git -C repo pull --ff-only || true
 elif [ -f repo/run_scripts/train_varp_volc.sh ]; then echo "== code already present (tarball)"
