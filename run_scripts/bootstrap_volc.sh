@@ -53,7 +53,8 @@ fi
 fetch_code() {
   for url in \
       "https://codeload.github.com/yuxuehui/memory_for_vlas/tar.gz/refs/heads/main" \
-      "${CODE_MIRROR:-https://ghfast.top/https://codeload.github.com/yuxuehui/memory_for_vlas/tar.gz/refs/heads/main}"; do
+      "${CODE_MIRROR:-https://ghfast.top/https://github.com/yuxuehui/memory_for_vlas/archive/refs/heads/main.tar.gz}" \
+      "https://gh-proxy.com/https://github.com/yuxuehui/memory_for_vlas/archive/refs/heads/main.tar.gz"; do
     echo "== fetching code tarball: ${url%%\?*}"
     if curl -fsSL --connect-timeout 20 --max-time 600 --speed-limit 20000 --speed-time 30 \
          "$url" -o /tmp/varp_code.tgz; then
@@ -77,12 +78,15 @@ pip -q install -U pip wheel setuptools
 if ! python -c "import torch" 2>/dev/null; then
   NVCC_VER=$(nvcc --version 2>/dev/null | grep -oE "release [0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
   case "$NVCC_VER" in
-    12.6|12.7) IDX=cu126 ;;
-    12.8|12.9|13.*|"") IDX=cu128 ;;
-    *) IDX=cu126 ;;
+    # PyPI's default linux wheel for torch 2.7.1 IS the cu126 build — installing it from the
+    # (usually domestically mirrored) PyPI index is far faster than download.pytorch.org, which
+    # is slow from mainland China. Only reach for the explicit index when we need a cu128 build.
+    12.6|12.7) echo "== nvcc $NVCC_VER -> torch 2.7.1 from PyPI (default = cu126)"
+               pip -q install torch==2.7.1 torchvision==0.22.1 ;;
+    *)         echo "== nvcc ${NVCC_VER:-unknown} -> torch 2.7.1+cu128 from the pytorch index"
+               pip -q install torch==2.7.1 torchvision==0.22.1 \
+                 --index-url https://download.pytorch.org/whl/cu128 ;;
   esac
-  echo "== nvcc ${NVCC_VER:-unknown} -> installing torch 2.7.1+$IDX"
-  pip -q install torch==2.7.1 torchvision==0.22.1 --index-url "https://download.pytorch.org/whl/$IDX"
 fi
 python -c "import gr00t, flash_attn" 2>/dev/null || {
   echo "== installing repo deps (flash-attn builds from source, ~15 min)"
