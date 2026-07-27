@@ -29,9 +29,16 @@ MASTER_PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 10000 ))}"
 
 # effective batch = PER_DEVICE * NUM_GPUS * ACCUM  (repo semantics: per_device =
 # global_batch_size / num_gpus, and accum MULTIPLIES on top — matched to the other arms at 32)
+TARGET_EFF="${TARGET_EFF:-32}"
 GLOBAL_BS=$(( PER_DEVICE * NUM_GPUS ))
-ACCUM=$(( 32 / GLOBAL_BS ))
+ACCUM=$(( TARGET_EFF / GLOBAL_BS ))
 [ "$ACCUM" -lt 1 ] && ACCUM=1
+EFF=$(( GLOBAL_BS * ACCUM ))
+if [ "$EFF" -ne "$TARGET_EFF" ]; then
+  echo "WARNING: effective batch $EFF != target $TARGET_EFF — PER_DEVICE x NUM_GPUS ($GLOBAL_BS)"
+  echo "         does not divide $TARGET_EFF. The other A/B arms ran $TARGET_EFF; record this"
+  echo "         deviation when comparing results, or pick a GPU count that divides it."
+fi
 
 # ---- preflight -----------------------------------------------------------------------------
 [ -f "$DATASET_PATH/meta/modality.json" ] || {
