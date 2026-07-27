@@ -30,6 +30,21 @@ if [ -z "$WORK" ]; then
 fi
 mkdir -p "$WORK"; cd "$WORK"
 
+# ---- 0b) system deps (the plain CUDA images are minimal: no venv module, no compiler) ------
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+PYV=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+need=""
+python3 -c "import venv, ensurepip" 2>/dev/null || need="$need python${PYV}-venv"
+command -v gcc  >/dev/null || need="$need build-essential"
+command -v git  >/dev/null || need="$need git"
+command -v curl >/dev/null || need="$need curl"
+python3 -c "import sysconfig,os;raise SystemExit(0 if os.path.exists(sysconfig.get_paths()['include']+'/Python.h') else 1)" \
+  2>/dev/null || need="$need python${PYV}-dev"
+if [ -n "$need" ]; then
+  echo "== apt-get installing:$need"
+  $SUDO apt-get -qq update && $SUDO DEBIAN_FRONTEND=noninteractive apt-get -qq install -y $need
+fi
+
 # ---- 1) code ------------------------------------------------------------------------------
 if [ ! -d repo/.git ]; then git clone --depth 1 "$REPO_URL" repo; else git -C repo pull --ff-only; fi
 
