@@ -98,9 +98,13 @@ if ! python -c "import torch" 2>/dev/null; then
   esac
 fi
 python -c "import gr00t, flash_attn" 2>/dev/null || {
-  echo "== installing repo deps (flash-attn builds from source, ~15 min)"
-  ( cd repo && MAX_JOBS="${MAX_JOBS:-16}" pip -q install -e . ) || \
-  ( cd repo && MAX_JOBS="${MAX_JOBS:-16}" pip -q install flash-attn==2.7.4.post1 --no-build-isolation \
+  # flash-attn's setup.py FIRST tries to fetch a prebuilt wheel from github releases, which hangs
+  # forever where github is unreachable (the Beijing instances). Force the local build instead.
+  export FLASH_ATTENTION_FORCE_BUILD=TRUE
+  export MAX_JOBS="${MAX_JOBS:-32}"          # ~2GB RAM per nvcc job; these boxes have ~1TB
+  echo "== installing repo deps (flash-attn builds from source, FORCE_BUILD, MAX_JOBS=$MAX_JOBS)"
+  ( cd repo && MAX_JOBS="$MAX_JOBS" pip -q install -e . ) || \
+  ( cd repo && MAX_JOBS="$MAX_JOBS" pip -q install flash-attn==2.7.4.post1 --no-build-isolation \
       && pip -q install -e . --no-build-isolation ) || {
     echo "ERROR: flash-attn failed to build. Most likely the image's CUDA toolkit is too new for"
     echo "       flash-attn 2.7.4 (CUDA 13 images are the usual cause). Recreate the instance on a"
