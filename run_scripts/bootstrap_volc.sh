@@ -17,7 +17,9 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"   # mainland-China mi
 # ---- 0) workspace with enough free space (dev-instance system disks are ~20GiB) ------------
 if [ -z "$WORK" ]; then
   best=""; best_avail=0
-  for cand in /mnt/* /data /workspace /home/* "$HOME" /opt; do
+  # /vepfs-* first: on this platform it is the shared parallel FS — hundreds of TB AND it
+  # survives instance deletion, so the 121G dataset is downloaded once for every future run.
+  for cand in /vepfs-*/*/* /vepfs-*/* /mnt/* /data /workspace /home/* "$HOME" /opt; do
     [ -d "$cand" ] && [ -w "$cand" ] || continue
     avail=$(df -BG --output=avail "$cand" 2>/dev/null | tail -1 | tr -dc '0-9') || continue
     [ -n "$avail" ] && [ "$avail" -gt "$best_avail" ] && { best_avail=$avail; best=$cand; }
@@ -46,7 +48,25 @@ if [ -n "$need" ]; then
 fi
 
 # ---- 1) code ------------------------------------------------------------------------------
-if [ ! -d repo/.git ]; then git clone --depth 1 "$REPO_URL" repo; else git -C repo pull --ff-only; fi
+# git-over-https to github is heavily throttled from mainland China (observed ~5 KB/s), while the
+# codeload tarball and mirrors are usually fine. Try tarball -> mirror tarball -> git clone.
+fetch_code() {
+  for url in \
+      "https://codeload.github.com/yuxuehui/memory_for_vlas/tar.gz/refs/heads/main" \
+      "${CODE_MIRROR:-https://ghfast.top/https://codeload.github.com/yuxuehui/memory_for_vlas/tar.gz/refs/heads/main}"; do
+    echo "== fetching code tarball: ${url%%\?*}"
+    if curl -fsSL --connect-timeout 20 --max-time 600 --speed-limit 20000 --speed-time 30 \
+         "$url" -o /tmp/varp_code.tgz; then
+      rm -rf repo && mkdir -p repo && tar xzf /tmp/varp_code.tgz -C repo --strip-components=1 \
+        && rm -f /tmp/varp_code.tgz && return 0
+    fi
+  done
+  echo "== tarball routes failed; falling back to git clone (may be slow)"
+  rm -rf repo && git clone --depth 1 "$REPO_URL" repo
+}
+if [ -d repo/.git ]; then git -C repo pull --ff-only || true
+elif [ -f repo/run_scripts/train_varp_volc.sh ]; then echo "== code already present (tarball)"
+else fetch_code; fi
 
 # ---- 2) env -------------------------------------------------------------------------------
 if [ ! -x venv/bin/python ]; then python3 -m venv venv; fi
