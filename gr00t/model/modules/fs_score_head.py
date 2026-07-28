@@ -63,14 +63,23 @@ class PatchScoreHead(nn.Module):
         nn.init.zeros_(self.out[-1].weight)
         nn.init.zeros_(self.out[-1].bias)
 
+    @property
+    def pdtype(self) -> torch.dtype:
+        """The head's parameter dtype. Under DeepSpeed bf16 the whole module is cast, so inputs
+        must follow the WEIGHTS (a fp32 input into a bf16 LayerNorm raises "expected scalar type
+        Float but found BFloat16"). Precision where it matters — the budget bisection and the
+        alpha/bias math — is fp32 regardless: `score` lifts the logits back to fp32 and
+        soft_topk/alpha_to_bias work there."""
+        return self.norm.weight.dtype
+
     def embed_local(self, v_Nd: torch.Tensor) -> torch.Tensor:
-        return self.local(self.norm(v_Nd.float()))
+        return self.local(self.norm(v_Nd.to(self.pdtype)))
 
     def embed_pool(self, v_Nd: torch.Tensor) -> torch.Tensor:
         """Frame-level context vector (h,). At inference this is computed ONCE per frame at
         push time over the frame's full patch set and stored frozen — which is exactly what
         training sees (per-frame pooling over the complete candidate frame)."""
-        return self.glob(self.norm(v_Nd.float())).mean(dim=-2)
+        return self.glob(self.norm(v_Nd.to(self.pdtype))).mean(dim=-2)
 
     def score(self, zl_Nh: torch.Tensor, zg_h: torch.Tensor,
               pos_N3: torch.Tensor | None) -> torch.Tensor:
@@ -79,13 +88,16 @@ class PatchScoreHead(nn.Module):
         zg = zg_h if zg_h.shape == zl_Nh.shape else zg_h.unsqueeze(-2).expand_as(zl_Nh)
         parts = [zl_Nh, zg]
         if self.use_pos:
-            p = torch.zeros(*zl_Nh.shape[:-1], 3, device=zl_Nh.device) \
-                if pos_N3 is None else pos_N3.float()
+            wd = self.pos.weight.dtype
+            p = torch.zeros(*zl_Nh.shape[:-1], 3, device=zl_Nh.device, dtype=wd) \
+                if pos_N3 is None else pos_N3.to(wd)
             # Normalise RAW (dt, y, x) here, not at the call sites: training reads them from
             # positions_from_flat and inference from the selector, and the head must see the
             # same scale from both or the learned position prior does not transfer.
-            parts.append(self.pos(p / self.pos_scale.to(p.device)))
-        return self.out(torch.cat(parts, dim=-1)).squeeze(-1)
+            parts.append(self.pos(p / self.pos_scale.to(device=p.device, dtype=wd)))
+        # fp32 out: the budget bisection, gumbel noise and log(alpha) bias all want full
+        # precision, and the caller's residual z-scores are fp32 too.
+        return self.out(torch.cat([q.to(zl_Nh.dtype) for q in parts], dim=-1)).squeeze(-1).float()
 
     def forward(self, v_BNd: torch.Tensor, pos_BN3: torch.Tensor | None = None) -> torch.Tensor:
         """(B, N, d) [+ (B, N, 3) normalised (dt,y,x)] -> (B, N) logits, pooling over N.
