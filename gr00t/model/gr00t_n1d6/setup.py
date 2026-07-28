@@ -88,6 +88,10 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 "mem_fs_inject", "mem_film_layers", "mem_source", "mem_framesamp_budget",
                 "mem_framesamp_frames", "mem_fs_select", "mem_fs_diff_stride",
                 "mem_fs_attn_layer", "mem_fs_diff_share", "mem_fs_tail_share", "mem_fs_pos_rope",
+                "mem_fs_learned_select", "mem_fs_score_hidden", "mem_fs_gate_tau_hi",
+                "mem_fs_gate_tau_lo", "mem_fs_gumbel_hi", "mem_fs_gumbel_lo",
+                "mem_fs_anneal_steps",
+                "mem_fs_score_residual",
                 "mem_varp_ckpt", "mem_varp_res", "mem_varp_budget", "mem_varp_gate_hard",
                 "mem_varp_budget_lambda", "mem_varp_target_frac", "mem_varp_gist_scales",
                 "mem_varp_view",
@@ -138,6 +142,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 "norm_spatial",
                 "fs_inject",  # v2b: framesamp-injection modules (absent from base/dual ckpts)
                 "var_pyramid",  # VAR-pyramid memory (frozen vae + selector; absent from base ckpts)
+                "fs_score_head",  # note-24 learned patch selection (absent from base ckpts)
             )
 
             def _is_tolerated(k: str) -> bool:
@@ -229,6 +234,26 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                                     _mod.weight.data.fill_(1.0)
                                 if getattr(_mod, "bias", None) is not None:
                                     _mod.bias.data.zero_()
+                    if (
+                        getattr(model.action_head, "fs_score_head", None) is not None
+                        and any("fs_score_head" in k for k in tolerated_missing)
+                    ):
+                        # Fast-init may leave these as torch.empty garbage. Restore the
+                        # module's own init, whose LAST layer is ZERO -- so step 0 emits a
+                        # constant score and the gate degenerates to "keep an arbitrary
+                        # budget-sized subset" rather than to noise. Reinitialising it as
+                        # random would start training from a random memory.
+                        _h = model.action_head.fs_score_head
+                        for m in _h.modules():
+                            if isinstance(m, torch.nn.Linear):
+                                m.weight.data.normal_(mean=0.0, std=0.02)
+                                if m.bias is not None:
+                                    m.bias.data.zero_()
+                            elif isinstance(m, torch.nn.LayerNorm):
+                                m.weight.data.fill_(1.0)
+                                m.bias.data.zero_()
+                        torch.nn.init.zeros_(_h.out[-1].weight)
+                        torch.nn.init.zeros_(_h.out[-1].bias)
                     if (
                         getattr(model.action_head, "var_pyramid", None) is not None
                         and any("var_pyramid" in k for k in tolerated_missing)

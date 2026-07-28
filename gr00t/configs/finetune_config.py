@@ -314,6 +314,17 @@ class FinetuneConfig:
     backward-compatible); 0.5 = 3-way nov∪act∪tail with equal act/tail."""
 
     mem_fs_pos_rope: bool = False
+    """note-24 learned selection: replace the hand-written novelty/act channels with a trained
+    score head + budgeted Soft-TopK gate. The gate rides the DiT cross-attn as an additive
+    log(alpha) bias, which is what carries gradient back to the head."""
+    mem_fs_learned_select: bool = False
+    mem_fs_score_hidden: int = 0          # 0 -> backbone_embedding_dim // 8
+    mem_fs_gate_tau_hi: float = 1.0       # Soft-TopK temperature, annealed hi -> lo
+    mem_fs_gate_tau_lo: float = 0.1
+    mem_fs_gumbel_hi: float = 1.0         # exploration noise, annealed to 0 (deterministic)
+    mem_fs_gumbel_lo: float = 0.0
+    mem_fs_anneal_steps: int = 20000
+    mem_fs_score_residual: bool = False
     """mem_fs_select='patch_union': PPE-style 3D RoPE (Δt,y,x) on the stored memory keys in the
     DiT cross-attention (note-23). False = no position (default, backward-compatible).
     Also honored by mem_fs_select='var_pyramid' (pyramid-token centers on the latent grid)."""

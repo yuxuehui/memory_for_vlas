@@ -133,6 +133,14 @@ if __name__ == "__main__":
     config.model.mem_fs_diff_share = ft_config.mem_fs_diff_share
     config.model.mem_fs_tail_share = ft_config.mem_fs_tail_share
     config.model.mem_fs_pos_rope = ft_config.mem_fs_pos_rope
+    config.model.mem_fs_learned_select = ft_config.mem_fs_learned_select
+    config.model.mem_fs_score_hidden = ft_config.mem_fs_score_hidden
+    config.model.mem_fs_gate_tau_hi = ft_config.mem_fs_gate_tau_hi
+    config.model.mem_fs_gate_tau_lo = ft_config.mem_fs_gate_tau_lo
+    config.model.mem_fs_gumbel_hi = ft_config.mem_fs_gumbel_hi
+    config.model.mem_fs_gumbel_lo = ft_config.mem_fs_gumbel_lo
+    config.model.mem_fs_anneal_steps = ft_config.mem_fs_anneal_steps
+    config.model.mem_fs_score_residual = ft_config.mem_fs_score_residual
     # VAR-pyramid multi-coarseness memory (mem_fs_select='var_pyramid'): stamp all knobs onto
     # the model config so the action head AND the saved checkpoint see them (getattr defaults
     # would otherwise silently train with RANDOM VAR weights).

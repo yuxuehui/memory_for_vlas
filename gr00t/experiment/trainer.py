@@ -196,6 +196,45 @@ class Gr00tTrainer(Trainer):
             # compute_metrics=partial(compute_eval_accuracy, action_offset=self.action_offset),
         )
 
+    def create_optimizer(self):
+        """Give the learned patch-selection head its own, much larger learning rate.
+
+        note-24: DynamicViT trains its prediction module at ~100x the backbone LR (and freezes
+        the backbone for the first sixth of training) because the selector has to converge
+        long before the consumer can adapt to it. Here the consumer (backbone + DiT) is
+        already trained, so the head is the only thing that needs to move fast; at the shared
+        LR it would barely leave its zero init within a 60k run.
+
+        No-op unless the model actually has an fs_score_head (mem_fs_learned_select).
+        """
+        if self.optimizer is not None:
+            return self.optimizer
+        mult = float(os.environ.get("FS_SCORE_LR_MULT", "100"))
+        head = [(n, p) for n, p in self.model.named_parameters()
+                if p.requires_grad and "fs_score_head" in n]
+        if not head or mult == 1.0:
+            return super().create_optimizer()
+        rest = [p for n, p in self.model.named_parameters()
+                if p.requires_grad and "fs_score_head" not in n]
+        decay = set(self.get_decay_parameter_names(self.model))
+        cls, kw = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+        wd = self.args.weight_decay
+        groups = [
+            {"params": rest, "weight_decay": wd},
+            {"params": [p for n, p in head if n in decay],
+             "weight_decay": wd, "lr": self.args.learning_rate * mult},
+            {"params": [p for n, p in head if n not in decay],
+             "weight_decay": 0.0, "lr": self.args.learning_rate * mult},
+        ]
+        groups = [g for g in groups if g["params"]]
+        self.optimizer = cls(groups, **kw)
+        logging.info(
+            f"[fs_score_head] {sum(p.numel() for _, p in head)/1e6:.2f}M params at "
+            f"lr={self.args.learning_rate * mult:.2e} ({mult}x the base "
+            f"{self.args.learning_rate:.2e})"
+        )
+        return self.optimizer
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch

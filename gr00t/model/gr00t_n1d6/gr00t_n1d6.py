@@ -41,6 +41,11 @@ class _MemAdaLNPool(nn.Module):
         return self.proj(pooled)  # (B, d_out); zero at init -> no-op
 
 
+def _zscore(x: torch.Tensor) -> torch.Tensor:
+    """Per-sample standardisation, so two channels with different units can be summed."""
+    return (x - x.mean(dim=-1, keepdim=True)) / x.std(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
 class Gr00tN1d6ActionHead(nn.Module):
     """Action head component for flow matching diffusion policy."""
 
@@ -134,6 +139,29 @@ class Gr00tN1d6ActionHead(nn.Module):
         # using those scores. `_pu_rel` holds (B, n_cand) relevance for pass B.
         self._pu_score_pass: bool = False
         self._pu_rel: torch.Tensor | None = None
+        # note-24 learned selection: a small head scores every candidate patch, a budgeted
+        # Soft-TopK turns the scores into alpha (sum alpha == budget), and alpha rides the DiT
+        # cross-attn as an additive log(alpha) bias on the memory keys. That bias IS the
+        # selection at training time (alpha=0 == deleted key) and it is what carries gradient
+        # back to the head -- the hand-written novelty/attn rule never had one.
+        self.mem_fs_learned_select = bool(getattr(config, "mem_fs_learned_select", False))
+        self.fs_score_head = None
+        if self.mem_fs_learned_select:
+            from gr00t.model.modules.fs_score_head import PatchScoreHead
+            self.fs_score_head = PatchScoreHead(
+                config.backbone_embedding_dim,
+                hidden=int(getattr(config, "mem_fs_score_hidden", 0)) or None,
+                use_pos=True,
+            )
+        self.mem_fs_gate_tau = (float(getattr(config, "mem_fs_gate_tau_hi", 1.0)),
+                                float(getattr(config, "mem_fs_gate_tau_lo", 0.1)))
+        self.mem_fs_gumbel = (float(getattr(config, "mem_fs_gumbel_hi", 1.0)),
+                              float(getattr(config, "mem_fs_gumbel_lo", 0.0)))
+        self.mem_fs_anneal_steps = int(getattr(config, "mem_fs_anneal_steps", 20000))
+        self.mem_fs_score_residual = bool(
+            getattr(config, "mem_fs_score_residual", False))
+        self._pu_alpha: torch.Tensor | None = None
+        self._fs_gate_step: int = 0
         # inference post-action write: [(selector, vis_current, kv_image_cols)] per batch item
         self._pu_pending: list | None = None
         # cross_attn ROUTING for the memory tokens that ride the action-head KV. False
@@ -500,6 +528,9 @@ class Gr00tN1d6ActionHead(nn.Module):
         flat_all = vis.reshape(B, Fn * n_img, d)
         self._pu_n_cand = Fn * n_img
         self._pu_n_img = n_img
+        if self.mem_fs_learned_select and self.fs_score_head is not None \
+                and not self._pu_score_pass:
+            return self._learned_select_mem_seq(flat_all, Fn, n_img)
         if self._pu_score_pass:
             if self.mem_fs_pos_rope:  # pass A KV = all candidates, in flat order
                 from gr00t.model.modules.fs_pos_rope import positions_from_flat
@@ -561,6 +592,94 @@ class Gr00tN1d6ActionHead(nn.Module):
             from gr00t.model.modules.fs_pos_rope import positions_from_flat
             self._pu_positions = positions_from_flat(keep_idx, n_img)
         return torch.gather(flat_all, 1, keep_idx.unsqueeze(-1).expand(B, budget, d)).contiguous()
+
+    def _learned_select_mem_seq(self, flat_all, Fn: int, n_img: int):
+        """note-24 learned selection. TRAIN: keep every candidate in the KV and gate it with a
+        differentiable alpha (sum alpha == budget), so the gradient of the action loss reaches
+        the score head. EVAL: hard top-budget, i.e. the alpha -> {0,1} limit of the same rule.
+
+        Pooling is PER CANDIDATE FRAME, not over the whole pool: the inference selector can
+        only ever pool the frame in front of it, so pooling globally here would be a
+        train/deploy mismatch of exactly the kind that sank patch_union v1.
+        """
+        from gr00t.model.modules.fs_pos_rope import positions_from_flat
+        from gr00t.model.modules.fs_score_head import (
+            alpha_to_bias, anneal, gumbel_perturb, hard_topk, soft_topk,
+        )
+
+        B, N, d = flat_all.shape
+        budget = min(self.mem_framesamp_budget, N)
+        allc = torch.arange(N, device=flat_all.device).unsqueeze(0).expand(B, -1)
+        pos = positions_from_flat(allc, n_img)                       # (B, N, 3) raw (dt,y,x)
+
+        head = self.fs_score_head
+        zl = head.embed_local(flat_all)                              # (B, N, h)
+        zg = head.embed_pool(flat_all.view(B, Fn, n_img, d))         # (B, F, h) per-frame
+        zg = zg.unsqueeze(2).expand(B, Fn, n_img, zg.shape[-1]).reshape(B, N, -1)
+        logits = head.score(zl, zg, pos)                             # (B, N)
+
+        if self.mem_fs_score_residual:
+            # Warm-start safety. The head's last layer is zero-init, so on its own it emits a
+            # CONSTANT score -- with Gumbel noise that is a uniformly random subset, i.e. a
+            # warm-started run would hand a random memory to a DiT already trained on a good
+            # one. Ranking by the existing heuristic plus a zero-init correction makes step 0
+            # reproduce (approximately) today's selection, so the head can only improve on it.
+            # NB approximately: this is the z-BLEND of the two channels, not their UNION, and
+            # note-21 §2 measured the blend as the weaker of the two (probe dup 0.840 vs
+            # 0.737). The union's two-way top-k is not a smooth function of a single score.
+            with torch.no_grad():
+                v32 = flat_all.detach().float().view(B, Fn, n_img, d)
+                prev = torch.cat([v32[:, :1], v32[:, :-1]], dim=1)
+                nov = (v32 - prev).abs().mean(-1)                    # (B, F, n_img)
+                _half = n_img // 2 if n_img % 2 == 0 else n_img
+                big = nov.amax(dim=(1, 2), keepdim=True) * 10.0 + 1.0
+                nov = nov.clone()
+                nov[:, 0, :_half] = big.squeeze(-1)   # frame-0 FRONT sentinel, finite for z
+                base = _zscore(nov.reshape(B, N))
+                if self._pu_rel is not None and self._pu_rel.shape[-1] == N:
+                    base = base + _zscore(self._pu_rel.to(base.device).float())
+            logits = logits + base.to(logits.dtype)
+
+        if not self.training:
+            keep_idx = torch.topk(hard_topk(logits, budget) * 1.0 + logits * 1e-6,
+                                  budget, dim=1).indices.sort(dim=1).values
+            self._pu_alpha = None
+            if self.mem_fs_pos_rope:
+                self._pu_positions = positions_from_flat(keep_idx, n_img)
+            return torch.gather(
+                flat_all, 1, keep_idx.unsqueeze(-1).expand(B, budget, d)).contiguous()
+
+        step, total = self._fs_gate_step, self.mem_fs_anneal_steps
+        tau = anneal(step, total, *self.mem_fs_gate_tau)
+        gs = anneal(step, total, *self.mem_fs_gumbel)
+        self._fs_gate_step = step + 1
+        alpha = soft_topk(gumbel_perturb(logits, gs), budget, tau)   # (B, N), sum == budget
+        self._pu_alpha = alpha_to_bias(alpha, flat_all.dtype)
+        if self.mem_fs_pos_rope:
+            self._pu_positions = pos
+        return flat_all.contiguous()          # every candidate stays; alpha does the pruning
+
+    def _pu_alpha_on(self):
+        """Arm the log(alpha) attention bias for the next DiT forward (no-op unless learned
+        selection produced one). Same gradient-checkpointing hazard as the key-RoPE: the bias
+        lives in module-global state that is cleared right after the forward, so a
+        backward-time recompute would silently see an ungated KV."""
+        if self._pu_alpha is None:
+            return
+        if getattr(self, "training", False) and getattr(
+            getattr(self, "model", None), "gradient_checkpointing", False
+        ):
+            raise RuntimeError(
+                "mem_fs_learned_select is incompatible with gradient_checkpointing on the "
+                "DiT: the alpha-bias global is cleared before backward-time recompute, which "
+                "would silently produce wrong gradients. Disable one of the two."
+            )
+        from gr00t.model.modules.fs_patch_union import set_alpha_bias
+        set_alpha_bias(self._pu_alpha, self._pu_alpha.shape[-1])
+
+    def _pu_alpha_off(self):
+        from gr00t.model.modules.fs_patch_union import clear_alpha_bias
+        clear_alpha_bias()
 
     def _var_pyramid_mem_seq(
         self,
@@ -1279,15 +1398,28 @@ class Gr00tN1d6ActionHead(nn.Module):
                             rows_sel, pending, rows_pos = [], [], []
                             for b in range(B):
                                 sel_b = self._fs_state[b]
-                                if not isinstance(sel_b, PatchUnionSelector) or (
-                                    reset_memory is not None and bool(reset_memory[b])
-                                ):
-                                    sel_b = PatchUnionSelector(
+                                if self.mem_fs_learned_select and self.fs_score_head is not None:
+                                    from gr00t.model.modules.fs_score_head import (
+                                        LearnedPatchSelector,
+                                    )
+                                    _cls = LearnedPatchSelector
+                                    _mk = lambda: LearnedPatchSelector(  # noqa: E731
+                                        self.fs_score_head,
+                                        budget=self.mem_framesamp_budget,
+                                        pos_frames=self.mem_framesamp_frames,
+                                    )
+                                else:
+                                    _cls = PatchUnionSelector
+                                    _mk = lambda: PatchUnionSelector(  # noqa: E731
                                         budget=self.mem_framesamp_budget,
                                         diff_share=self.mem_fs_diff_share,
                                         stride=self.mem_fs_diff_stride,
                                         tail_share=self.mem_fs_tail_share,
                                     )
+                                if not isinstance(sel_b, _cls) or (
+                                    reset_memory is not None and bool(reset_memory[b])
+                                ):
+                                    sel_b = _mk()
                                     self._fs_state[b] = sel_b
                                 v_b = vis_current[b].detach()
                                 idx_b = im_cur[b][:Lm_kv].nonzero(as_tuple=False).squeeze(1)[
@@ -1610,6 +1742,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         mem_temb_add = backbone_output.get("mem_temb_add", None)
 
         self._pu_rope_on()  # PPE key RoPE on the selected memory tail (no-op unless enabled)
+        self._pu_alpha_on()  # note-24 learned gate (no-op unless enabled)
         try:
             if self.config.use_alternate_vl_dit:
                 image_mask = backbone_output.image_mask
@@ -1639,6 +1772,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 )
         finally:
             self._pu_rope_off()
+            self._pu_alpha_off()
 
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
@@ -1755,6 +1889,7 @@ class Gr00tN1d6ActionHead(nn.Module):
 
             # Run model forward.
             self._pu_rope_on()  # PPE key RoPE on the memory tail (no-op unless enabled)
+            self._pu_alpha_on()  # note-24 learned gate (no-op unless enabled)
             try:
                 if self.config.use_alternate_vl_dit:
                     model_output = self.model(
@@ -1778,6 +1913,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                     )
             finally:
                 self._pu_rope_off()
+                self._pu_alpha_off()
             pred = self.action_decoder(model_output, embodiment_id)
 
             pred_velocity = pred[:, -self.action_horizon :]

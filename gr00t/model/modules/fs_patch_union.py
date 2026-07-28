@@ -30,12 +30,24 @@ import torch.nn.functional as F
 # Minimal, flag-gated sdpa patch: during the patch_union SCORING pass we need the DiT's
 # action->candidate cross-attention at one layer. Identified by Lq != Lk (cross-attn) and
 # call-count mod n_cross == layer. Inactive (zero overhead) outside the scoring pass.
-_CAP = {"scores": None, "count": 0, "layer": 13, "n_cross": 16, "active": False}
+_CAP = {"scores": None, "count": 0, "layer": 13, "n_cross": 16, "active": False,
+        # DIAGNOSTIC ONLY (Markdown/patch_memory_labels): additionally accumulate the
+        # action->key attention at other cross-attn layers, so a multi-layer act channel can
+        # be replayed offline. Empty by default -> the patched sdpa below is byte-identical
+        # to the single-layer behaviour the trained models were built on.
+        "extra_layers": set(), "extra": {}}
 _PATCHED = False
 # PPE-style key RoPE (note-23): when active, rotate the LAST `rope_M` keys of every cross-attn
 # (Lq != Lk) by cos/sin, so the memory patches' (Δt,y,x) enter the QK dot product. Applied
 # BEFORE the act-capture scoring so both the capture and the real sdpa see rotated keys.
 _ROPE = {"cos": None, "sin": None, "M": 0, "active": False}
+# Learned selection gate (note-24, `mem_fs_learned_select`): an ADDITIVE bias log(alpha) on the
+# last `M` keys of every cross-attn. exp(P + log alpha) = exp(P) * alpha, i.e. DynamicViT's
+# masked attention A~_ij = exp(P_ij) alpha_j / sum_k exp(P_ik) alpha_k -- so alpha=0 is exactly
+# a deleted key, NOT a zeroed one (a zeroed key would still occupy the softmax denominator).
+# That equivalence is what makes the training forward (all candidates, soft alpha) converge to
+# the deployment forward (budget keys, alpha in {0,1}) as the temperature anneals.
+_ALPHA = {"bias": None, "M": 0, "active": False}
 
 
 def set_rope(cos, sin, M: int) -> None:
@@ -45,6 +57,15 @@ def set_rope(cos, sin, M: int) -> None:
 def clear_rope() -> None:
     _ROPE["cos"] = _ROPE["sin"] = None
     _ROPE["M"], _ROPE["active"] = 0, False
+
+
+def set_alpha_bias(bias, M: int) -> None:
+    """bias: (B, M) = log(alpha) for the memory keys sitting at the KV tail."""
+    _ALPHA["bias"], _ALPHA["M"], _ALPHA["active"] = bias, int(M), True
+
+
+def clear_alpha_bias() -> None:
+    _ALPHA["bias"], _ALPHA["M"], _ALPHA["active"] = None, 0, False
 
 
 def install_capture(layer: int, n_cross: int) -> None:
@@ -66,6 +87,26 @@ def install_capture(layer: int, n_cross: int) -> None:
                     k = kk
             except Exception:
                 pass
+        # Learned selection gate: fold log(alpha) into the additive attention mask on the
+        # memory tail. Cross-attn only (Lq != Lk), same gate as the key-RoPE above.
+        if (_ALPHA["active"] and _ALPHA["bias"] is not None
+                and q.shape[-2] != k.shape[-2] and not is_causal):
+            try:
+                M, ab = _ALPHA["M"], _ALPHA["bias"]
+                Lk = k.shape[-2]
+                if 0 < M <= Lk and ab.shape[-1] == M:
+                    add = q.new_zeros(ab.shape[0], 1, 1, Lk)
+                    add[..., -M:] = ab.to(add.dtype).view(ab.shape[0], 1, 1, M)
+                    if attn_mask is None:
+                        attn_mask = add
+                    elif attn_mask.dtype == torch.bool:
+                        # sdpa bool semantics: True participates. Keep that, add the gate.
+                        attn_mask = torch.where(
+                            attn_mask, add, torch.finfo(add.dtype).min)
+                    else:
+                        attn_mask = attn_mask + add
+            except Exception:
+                pass
         out = orig(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
                    is_causal=is_causal, scale=scale, **kw)
         if _CAP["active"]:
@@ -73,14 +114,20 @@ def install_capture(layer: int, n_cross: int) -> None:
                 if q.shape[-2] != k.shape[-2]:
                     li = _CAP["count"] % _CAP["n_cross"]
                     _CAP["count"] += 1
-                    if li == _CAP["layer"]:
+                    if li == _CAP["layer"] or li in _CAP["extra_layers"]:
                         sc = scale if scale is not None else q.shape[-1] ** -0.5
                         sco = (q.float() @ k.float().transpose(-2, -1)) * sc
                         if attn_mask is not None and attn_mask.dtype != torch.bool:
                             sco = sco + attn_mask.float()
                         a = sco.softmax(-1).mean(dim=(1, 2)).detach()  # (B, Lk)
-                        prev = _CAP["scores"]
-                        _CAP["scores"] = a if prev is None or prev.shape != a.shape else prev + a
+                        if li == _CAP["layer"]:
+                            prev = _CAP["scores"]
+                            _CAP["scores"] = (a if prev is None or prev.shape != a.shape
+                                              else prev + a)
+                        if li in _CAP["extra_layers"]:
+                            prev = _CAP["extra"].get(li)
+                            _CAP["extra"][li] = (a if prev is None or prev.shape != a.shape
+                                                 else prev + a)
             except Exception:
                 pass
         return out
@@ -94,12 +141,24 @@ def capture_begin(layer: int, n_cross: int):
     install_capture(layer, n_cross)
     _CAP["scores"] = None
     _CAP["count"] = 0
+    _CAP["extra"] = {}
     _CAP["active"] = True
 
 
 def capture_end():
     _CAP["active"] = False
     return _CAP["scores"]
+
+
+def capture_extra_layers(layers) -> None:
+    """DIAGNOSTIC: also accumulate these cross-attn layer indices (see `_CAP['extra_layers']`).
+    Pass an empty iterable to restore the default single-layer capture."""
+    _CAP["extra_layers"] = {int(x) for x in layers}
+
+
+def get_extra() -> dict:
+    """{layer: (B, Lk)} accumulated since the last capture_begin()."""
+    return dict(_CAP["extra"])
 
 
 def pix_cells(pix_flat: torch.Tensor, n_img: int) -> torch.Tensor | None:

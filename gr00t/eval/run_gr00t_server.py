@@ -64,6 +64,7 @@ class ServerConfig:
     """patch_union: tail_L15 channel share of the non-novelty budget (default 0.0 = 2-way)."""
 
     mem_fs_pos_rope: bool | None = None
+    mem_fs_learned_select: bool | None = None
     """patch_union: PPE-style 3D key RoPE on memory tokens (default from checkpoint)."""
 
 
@@ -102,6 +103,9 @@ def main(config: ServerConfig):
         if config.mem_fs_tail_share is not None:
             policy.model.action_head.mem_fs_tail_share = float(config.mem_fs_tail_share)
             print(f"  mem_fs_tail_share override: {config.mem_fs_tail_share}")
+        if config.mem_fs_learned_select is not None:
+            policy.model.action_head.mem_fs_learned_select = bool(config.mem_fs_learned_select)
+            print(f"  mem_fs_learned_select override: {config.mem_fs_learned_select}")
         if config.mem_fs_pos_rope is not None:
             policy.model.action_head.mem_fs_pos_rope = bool(config.mem_fs_pos_rope)
             print(f"  mem_fs_pos_rope override: {config.mem_fs_pos_rope}")

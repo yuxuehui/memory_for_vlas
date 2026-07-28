@@ -180,6 +180,21 @@ class Gr00tN1d6Config(PretrainedConfig):
     mem_fs_tail_share: float = 0.0
     # patch_union: PPE-style 3D RoPE (Δt,y,x) on stored memory keys in DiT cross-attn (note-23).
     mem_fs_pos_rope: bool = False
+    # note-24 LEARNED selection: a PatchScoreHead scores every candidate patch and a budgeted
+    # Soft-TopK turns the scores into alpha (sum alpha == budget); alpha rides the DiT
+    # cross-attn as an additive log(alpha) bias on the memory keys, so alpha=0 is exactly a
+    # deleted key and the action loss can finally reach the selector. Replaces the
+    # novelty/act/tail channels when True (mem_fs_diff_share etc. are then unused).
+    mem_fs_learned_select: bool = False
+    mem_fs_score_hidden: int = 0            # 0 -> backbone_embedding_dim // 8
+    mem_fs_gate_tau_hi: float = 1.0         # Soft-TopK temperature, annealed hi -> lo so the
+    mem_fs_gate_tau_lo: float = 0.1         #   train forward converges to the hard deployment
+    mem_fs_gumbel_hi: float = 1.0           # exploration noise: without it only ALREADY
+    mem_fs_gumbel_lo: float = 0.0           #   selected patches receive gradient
+    mem_fs_anneal_steps: int = 20000
+    # rank by the EXISTING heuristic (z novelty + z act) plus a zero-init correction, so a
+    # warm-started run starts from today's selection instead of a random subset.
+    mem_fs_score_residual: bool = False
     # mem_cond_type=="cross_attn" only. Cross-attn ROUTING for the memory tokens that ride
     # the action-head KV. False (default) = memory tagged image_mask=False (TEXT pathway,
     # current behavior); True = memory tagged image_mask=True (IMAGE pathway). Only the
