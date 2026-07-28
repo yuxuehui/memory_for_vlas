@@ -75,4 +75,5 @@ python -m torch.distributed.run --nproc_per_node="$NUM_GPUS" --master_port="$MAS
   --mem-framesamp-budget 512 \
   --mem-fs-select var_pyramid --mem-varp-ckpt "$VAE_CKPT" \
   --mem-varp-res 128 --mem-varp-budget 512 --mem-varp-budget-lambda 0.05 \
-  --mem-varp-gist-scales 4 --mem-fs-pos-rope
+  --mem-varp-gist-scales 4 --mem-fs-pos-rope \
+  --no-save-only-model

@@ -123,6 +123,11 @@ class FinetuneConfig:
     save_total_limit: int = 5
     """Maximum number of checkpoints to keep before older ones are deleted."""
 
+    save_only_model: bool = True
+    """Weights-only checkpoints (~7GB vs ~35GB). ⚠️ They CANNOT be resumed — training always runs
+    with resume_from_checkpoint=True, so an interrupted run restarts from zero. Pass
+    --no-save-only-model for long unattended runs (a kill then costs one save interval)."""
+
     num_gpus: int = 1
     """Number of GPUs available for distributed or single-node training."""
 

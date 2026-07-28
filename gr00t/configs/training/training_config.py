@@ -60,6 +60,13 @@ class TrainingConfig:
     save_best_eval_metric_name: str = ""
     save_best_eval_metric_greater_is_better: bool = True
 
+    save_only_model: bool = True
+    """Checkpoints hold model weights only (~7GB instead of ~35GB), so frequent checkpoints fit
+    on disk for overfit-curve eval. ⚠️ Trainer.train() runs with resume_from_checkpoint=True, and
+    a weights-only checkpoint CANNOT be resumed ("Can't find a valid checkpoint at ..."), so any
+    interrupted run restarts from zero. Set False for long/unattended runs where surviving a kill
+    matters more than checkpoint size."""
+
     # DeepSpeed (default)
     deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3)
     gradient_checkpointing: bool = False

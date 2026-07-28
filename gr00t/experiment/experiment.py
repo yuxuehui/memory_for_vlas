@@ -213,8 +213,10 @@ def run(config: Config):
         logging_steps=config.training.logging_steps,
         save_steps=config.training.save_steps,
         save_total_limit=config.training.save_total_limit,
-        save_only_model=True,  # checkpoints = model weights only (no optimizer) -> ~7GB not ~35GB,
-                               # so frequent (every 2k) checkpoints fit on disk for overfit-curve eval
+        # Weights-only checkpoints are ~7GB instead of ~35GB, but they cannot be resumed (see the
+        # field docs) — long unattended runs should set this False so a kill costs one save
+        # interval instead of the whole run.
+        save_only_model=config.training.save_only_model,
         fp16=config.training.fp16,
         bf16=config.training.bf16,
         tf32=config.training.tf32,
