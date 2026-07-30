@@ -235,6 +235,33 @@ class Gr00tTrainer(Trainer):
         )
         return self.optimizer
 
+    def training_step(self, *args, **kwargs):
+        """Optional per-module gradient-norm probe (FS_GRAD_PROBE=<every_n_steps>).
+
+        The trainer only logs ONE global grad_norm over every trainable parameter, which says
+        nothing about *which* module is responsible when it comes out at 1e7. This prints the
+        top offenders so the blame is located instead of guessed. Off unless the env var is
+        set; the cost is one pass over the parameter list on the probed steps only.
+        """
+        loss = super().training_step(*args, **kwargs)
+        n = int(os.environ.get("FS_GRAD_PROBE", "0"))
+        if n > 0 and self.state.global_step % n == 0:
+            per_mod: dict[str, float] = {}
+            for name, p in self.model.named_parameters():
+                g = getattr(p, "grad", None)
+                if g is None:
+                    continue
+                # ZeRO-2 keeps grads local, so this is the shard's contribution — fine for
+                # ranking modules, not a substitute for the global norm.
+                key = ".".join(name.split(".")[:3])
+                per_mod[key] = per_mod.get(key, 0.0) + float(g.detach().float().pow(2).sum())
+            top = sorted(per_mod.items(), key=lambda kv: -kv[1])[:6]
+            logging.info(
+                "[grad_probe step=%d] %s", self.state.global_step,
+                "  ".join(f"{k}={v ** 0.5:.3g}" for k, v in top),
+            )
+        return loss
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
