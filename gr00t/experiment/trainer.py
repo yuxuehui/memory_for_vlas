@@ -246,13 +246,26 @@ class Gr00tTrainer(Trainer):
         loss = super().training_step(*args, **kwargs)
         n = int(os.environ.get("FS_GRAD_PROBE", "0"))
         if n > 0 and self.state.global_step % n == 0:
+            # Under ZeRO the gradients do NOT live in `p.grad` — DeepSpeed keeps them in its own
+            # flattened partitions, so reading p.grad yields None on every parameter and the
+            # probe prints an empty line. safe_get_full_grad reconstructs the full gradient for
+            # ZeRO 1/2/3; fall back to p.grad when DeepSpeed is not in play (single-GPU runs).
+            try:
+                from deepspeed.utils import safe_get_full_grad
+            except Exception:
+                safe_get_full_grad = None
             per_mod: dict[str, float] = {}
             for name, p in self.model.named_parameters():
-                g = getattr(p, "grad", None)
+                g = None
+                if safe_get_full_grad is not None:
+                    try:
+                        g = safe_get_full_grad(p)
+                    except Exception:
+                        g = None
+                if g is None:
+                    g = getattr(p, "grad", None)
                 if g is None:
                     continue
-                # ZeRO-2 keeps grads local, so this is the shard's contribution — fine for
-                # ranking modules, not a substitute for the global norm.
                 key = ".".join(name.split(".")[:3])
                 per_mod[key] = per_mod.get(key, 0.0) + float(g.detach().float().pow(2).sum())
             top = sorted(per_mod.items(), key=lambda kv: -kv[1])[:6]
