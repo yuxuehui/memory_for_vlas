@@ -84,6 +84,10 @@ class TrainingConfig:
     # Hardware
     num_gpus: int = 1
     dataloader_num_workers: int = 2
+    # Seconds a rank will wait in a collective before NCCL declares a timeout. HF defaults to
+    # 1800, which the first-epoch shard caching can exceed on a large dataset — the ranks that
+    # cache faster then die in the barrier. 7200 costs nothing when nothing is stuck.
+    ddp_timeout: int = 7200
 
     # Data handling
     remove_unused_columns: bool = False

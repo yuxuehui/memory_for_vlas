@@ -228,6 +228,11 @@ def run(config: Config):
         deepspeed=deepspeed_config,
         ddp_find_unused_parameters=False,
         ddp_bucket_cap_mb=config.training.ddp_bucket_cap_mb,
+        # The first epoch caches the dataset shards, and ranks finish that at different times.
+        # With HF's 1800s default the ranks that finish early sit in a collective long enough to
+        # trip the NCCL watchdog, and the whole job dies before step 1 (observed on a 4xA100 box
+        # with the 121G RoboMME copy: every rank raised a collective timeout ~16 min in).
+        ddp_timeout=config.training.ddp_timeout,
         eval_strategy=config.training.eval_strategy,
         eval_steps=config.training.eval_steps,
         batch_eval_metrics=True,
