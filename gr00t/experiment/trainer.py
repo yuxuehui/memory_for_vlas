@@ -238,41 +238,43 @@ class Gr00tTrainer(Trainer):
     def training_step(self, *args, **kwargs):
         """Optional per-module gradient-norm probe (FS_GRAD_PROBE=<every_n_steps>).
 
-        The trainer only logs ONE global grad_norm over every trainable parameter, which says
-        nothing about *which* module is responsible when it comes out at 1e7. This prints the
-        top offenders so the blame is located instead of guessed. Off unless the env var is
-        set; the cost is one pass over the parameter list on the probed steps only.
+        The trainer logs ONE global grad_norm over every trainable parameter, which says nothing
+        about *which* module is responsible when it reads 1e7. This prints the top offenders.
+
+        ⚠️ SINGLE PROCESS ONLY. It reads `p.grad`, which is empty under ZeRO; the obvious fix —
+        DeepSpeed's `safe_get_full_grad` — is a COLLECTIVE, and calling one per parameter from
+        inside `training_step` injects thousands of unscheduled all-reduces into DeepSpeed's own
+        communication sequence. On a 4-GPU box that deadlocked every rank before step 1 (61
+        consecutive NCCL collective timeouts, ~15 min each, zero training steps). So the probe
+        refuses to run distributed rather than offering a version that hangs. Reproduce the
+        gradient question on one GPU, where it is safe.
         """
         loss = super().training_step(*args, **kwargs)
         n = int(os.environ.get("FS_GRAD_PROBE", "0"))
-        if n > 0 and self.state.global_step % n == 0:
-            # Under ZeRO the gradients do NOT live in `p.grad` — DeepSpeed keeps them in its own
-            # flattened partitions, so reading p.grad yields None on every parameter and the
-            # probe prints an empty line. safe_get_full_grad reconstructs the full gradient for
-            # ZeRO 1/2/3; fall back to p.grad when DeepSpeed is not in play (single-GPU runs).
-            try:
-                from deepspeed.utils import safe_get_full_grad
-            except Exception:
-                safe_get_full_grad = None
-            per_mod: dict[str, float] = {}
-            for name, p in self.model.named_parameters():
-                g = None
-                if safe_get_full_grad is not None:
-                    try:
-                        g = safe_get_full_grad(p)
-                    except Exception:
-                        g = None
-                if g is None:
-                    g = getattr(p, "grad", None)
-                if g is None:
-                    continue
-                key = ".".join(name.split(".")[:3])
-                per_mod[key] = per_mod.get(key, 0.0) + float(g.detach().float().pow(2).sum())
-            top = sorted(per_mod.items(), key=lambda kv: -kv[1])[:6]
-            logging.info(
-                "[grad_probe step=%d] %s", self.state.global_step,
-                "  ".join(f"{k}={v ** 0.5:.3g}" for k, v in top),
-            )
+        if n <= 0 or self.state.global_step % n != 0:
+            return loss
+        if torch.distributed.is_available() and torch.distributed.is_initialized() \
+                and torch.distributed.get_world_size() > 1:
+            if not getattr(self, "_grad_probe_warned", False):
+                self._grad_probe_warned = True
+                logging.warning(
+                    "[grad_probe] disabled: world_size=%d. Reading ZeRO gradients requires a "
+                    "collective per parameter, which deadlocks inside training_step. Run the "
+                    "probe on a single GPU.", torch.distributed.get_world_size(),
+                )
+            return loss
+        per_mod: dict[str, float] = {}
+        for name, p in self.model.named_parameters():
+            g = getattr(p, "grad", None)
+            if g is None:
+                continue
+            key = ".".join(name.split(".")[:3])
+            per_mod[key] = per_mod.get(key, 0.0) + float(g.detach().float().pow(2).sum())
+        top = sorted(per_mod.items(), key=lambda kv: -kv[1])[:6]
+        logging.info(
+            "[grad_probe step=%d] %s", self.state.global_step,
+            "  ".join(f"{k}={v ** 0.5:.3g}" for k, v in top),
+        )
         return loss
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
