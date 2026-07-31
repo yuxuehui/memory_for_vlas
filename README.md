@@ -404,15 +404,7 @@ not directly comparable.)
 
 ### 5b. Keyframe-selection A/B (all @60k, 16 tasks × 50 eps = 800 episodes each)
 
-Same pipeline throughout, all at K=8 / `cross_attn` / `memory_type moment_token`; vanilla is the K=4
-no-memory control. **The equal-budget control covers the three *selection* arms only** — framesamp,
-tokendrop and patch_union each place `--mem-framesamp-budget` = 512 patch tokens in the DiT KV, so
-comparing those three isolates **selection** and nothing else.
-
-⚠️ **HAMLET is not inside that control.** Its aggregator *consumes* K·n_q = 8×4 = 32 moment tokens of
-history but the caller keeps only the last `n_q` rows (`mem_out[:, -v_nq:, :]`,
-[`gr00t_n1d6.py:930`](gr00t/model/gr00t_n1d6/gr00t_n1d6.py#L930)), so **4 tokens** reach the KV where the
-selection arms put **512** — a 128× difference in footprint.
+Same pipeline throughout, all at K=8 / `cross_attn` / `memory_type moment_token`; vanilla is the K=4 no-memory control. **The equal-budget control covers the three *selection* arms only** — framesamp, tokendrop and patch_union each place `--mem-framesamp-budget` = 512 patch tokens in the DiT KV, so comparing those three isolates **selection** and nothing else.
 
 | arm | consumed by the aggregator | **reaching the DiT KV** |
 |---|--:|--:|
