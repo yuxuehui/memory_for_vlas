@@ -106,7 +106,7 @@ which is historically mismatched — see caveats):
 |---|---|---|---|---|---|---|---|
 | 1 | **FrameSamp** (uniform) | none — content-blind even coverage | frame | loader `linspace(0, T-1, F)` (acausal) | rolling FIFO of the F most recent frames ⚠️ **mismatched** | `--mem-fs-select fifo` (default) | ✅ **12.4 %** |
 | 2 | **TokenDrop** (diff) | **observation change**: mean \|pixel diff\| vs the last scored frame (frame-0 sentinel + top-(F−2) peaks ≤ anchor) | frame | `_fs_diff_scores` / `_fs_diff_indices` (causal, memoized per episode) | `DiffFrameSelector` (incremental heap) | `--mem-fs-select diff [--mem-fs-diff-stride 8]` | ✅ **14.0 %** |
-| 3 | **Action-conditioned patch memory** (patch_union) | **novelty ∪ action-relevance**: token-space Δ top-(αM) **∪** DiT action→patch cross-attention top-((1−α)M) | **patch** | `_patch_union_mem_seq` + two-pass `_patch_union_score_pass` (no_grad pass over *all* candidates captures layer-ℓ attention) | read heap → capture attn in the real forward → `_pu_commit` post-action write | `--mem-fs-select patch_union [--mem-fs-attn-layer 13 --mem-fs-diff-share 0.5]` | ✅ **14.4 %** (V2 @50k) |
+| 3 | **Action-conditioned patch memory** (patch_union) | **novelty ∪ action-relevance**: token-space Δ top-(αM) **∪** DiT action→patch cross-attention top-((1−α)M) | **patch** | `_patch_union_mem_seq` + two-pass `_patch_union_score_pass` (no_grad pass over *all* candidates captures layer-ℓ attention) | read heap → capture attn in the real forward → `_pu_commit` post-action write | `--mem-fs-select patch_union [--mem-fs-attn-layer 13 --mem-fs-diff-share 0.5]` | ✅ **17.25 %** (V2 @60k) |
 | 3b | **Learned patch selection** (patch_union + `--mem-fs-learned-select`) | the same candidates, but the score is a **trained** head instead of a hand-written union — differentiable top-k via an additive `log α` attention bias | **patch** | `_learned_select_mem_seq`: `PatchScoreHead` → budgeted Soft-TopK → `log α` bias on the memory keys (all candidates stay in the KV) | one heap ranked by the learned score, entries **re-scored every call** (Δt drifts) | `--mem-fs-learned-select [--mem-fs-score-residual --mem-fs-anneal-steps 20000]` | ⚠️ diverged — see below |
 
 - **1 → 2** trades uniform coverage for event coverage: wins the event-sparse suites (Counting +11.0,
@@ -115,10 +115,17 @@ which is historically mismatched — see caveats):
 - **2 → 3** drops the selection unit from frames to **patches** and adds a second, *task-conditioned*
   channel: the policy's own action queries vote on which patches matter. At the same 512-token budget a
   patch-level union spans ~120 timesteps instead of 8 frames.
+  **Final read (V2 @60k, 16 tasks × 50 eps, all cells stride 8):** 17.25 % overall vs tokendrop 14.00 %
+  — +3.25, winning 3 of 4 suites (Reference 18.0 vs 8.0, Permanence 24.5 vs 19.5, Counting 22.0 vs 19.5),
+  losing Imitation (4.5 vs 9.0). ⚠️ **`z = +1.79`, two-sided `p ≈ 0.073` — the direction is stable but
+  this is *not* a significant win.** Both curves are flattening by 60k, so closing it needs more eval
+  episodes, not more training steps (16 × 150 eps ≈ 2400/cell would put the same effect size near z ≈ 3.1).
+  PatternLock and RouteStick sit at 0–2 % from v1 through V2@60k while tokendrop gets 6 % and 4 % — an
+  unexplained failure mode that neither training length nor the causal-frame fix touches.
 - **3 → 3b** asks whether the *rule* can be trained rather than written. It has to be: V2 tripled success
-  from 30k (4.6 %) to 50k (14.4 %) while the memory's geometry stayed bit-for-bit identical, so the
-  hand-written union is effectively a fixed heuristic that training cannot move. **Not yet working** —
-  see the divergence note under Method 5.
+  between 30k and 50k while the memory's geometry stayed bit-for-bit identical, so the hand-written union
+  is effectively a fixed heuristic that training cannot move. **Not yet working** — see the divergence
+  note under Method 5.
 
 - **Read-out size** — set by `--n-moment-tokens` (`n_q`): **4** (light; the ~18.4 baseline) or **128** (wide
   bank; tests token-count vs the pooling ceiling — scaling 32× barely helps, so the limit is the *pooling op*).
