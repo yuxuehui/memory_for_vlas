@@ -38,6 +38,10 @@ cd "$W/repo"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export FS_GRAD_PROBE=0            # see (1) above — never non-zero on a multi-GPU run
+export FS_SCORE_LR_MULT="${FS_SCORE_LR_MULT:-10}"   # 100 (the DynamicViT number) diverges here: at
+                    # base lr 1e-4 that is 1e-2 on a 1.25M MLP with a LayerNorm, and between step
+                    # 1.2k and 10k norm.weight went 1 -> 88, alpha saturated, loss parked at 0.34
+                    # and grad_norm hit 1e9. DynamicViT pairs 100x with a frozen, 0.01x backbone.
 
 # 60k steps of work should not live only on this disk.
 ( while true; do sleep 900; gsutil -m -q rsync -r "$OUT" "$BUCKET" 2>/dev/null || true; done ) &
@@ -62,7 +66,7 @@ for i in $(seq 1 200); do
     --hamlet-mode finetune --learning-rate 1e-4 --max-grad-norm 1.0 --tune-top-llm-layers 4 \
     --n-moment-tokens 4 --memory-window 8 --memory-stride 16 --memory-num-layers 2 \
     --memory-type moment_token --no-freeze-moment-tokens \
-    --max-steps 60000 --save-steps 10000 --save-total-limit 10 \
+    --max-steps 60000 --save-steps 2000 --save-total-limit 10 \
     --output-dir "$OUT" \
     --mem-cond-type cross_attn --mem-source framesamp --mem-framesamp-frames 8 \
     --mem-framesamp-budget 512 \

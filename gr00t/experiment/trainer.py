@@ -277,7 +277,33 @@ class Gr00tTrainer(Trainer):
         )
         return loss
 
+    def _log_score_head_health(self, logs: dict[str, float]) -> None:
+        """Surface fs_score_head divergence, which neither `loss` nor the global `grad_norm`
+        reports in time.
+
+        Learned-select at the default 100x head LR (1e-2) blew up between step 1.2k and 10k:
+        the head's LayerNorm weight went from 1.0 to 88 and its biases from 0 to 85, alpha
+        saturated, and loss parked at 0.34 with grad_norm 1e9. Because max_grad_norm clips the
+        GLOBAL norm, one diverging module freezes the whole model — and the loss curve alone
+        looks like a plateau, not a failure. `norm.weight` should stay near 1.
+        """
+        try:
+            for name, p in self.model.named_parameters():
+                if name.endswith("fs_score_head.norm.weight"):
+                    m = float(p.detach().float().abs().max())
+                    logs["fs_head_normw_absmax"] = round(m, 4)
+                    if m > 2.0 or m < 0.5:
+                        logging.warning(
+                            "[fs_score_head] norm.weight |max|=%.3g has left [0.5, 2] — the head "
+                            "is diverging. Lower FS_SCORE_LR_MULT (currently %s).",
+                            m, os.environ.get("FS_SCORE_LR_MULT", "100"),
+                        )
+                    return
+        except Exception:
+            pass
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        self._log_score_head_health(logs)
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
         self.state.epoch = None
