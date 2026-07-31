@@ -106,7 +106,8 @@ which is historically mismatched — see caveats):
 |---|---|---|---|---|---|---|---|
 | 1 | **FrameSamp** (uniform) | none — content-blind even coverage | frame | loader `linspace(0, T-1, F)` (acausal) | rolling FIFO of the F most recent frames ⚠️ **mismatched** | `--mem-fs-select fifo` (default) | ✅ **12.4 %** |
 | 2 | **TokenDrop** (diff) | **observation change**: mean \|pixel diff\| vs the last scored frame (frame-0 sentinel + top-(F−2) peaks ≤ anchor) | frame | `_fs_diff_scores` / `_fs_diff_indices` (causal, memoized per episode) | `DiffFrameSelector` (incremental heap) | `--mem-fs-select diff [--mem-fs-diff-stride 8]` | ✅ **14.0 %** |
-| 3 | **Action-conditioned patch memory** (patch_union) | **novelty ∪ action-relevance**: token-space Δ top-(αM) **∪** DiT action→patch cross-attention top-((1−α)M) | **patch** | `_patch_union_mem_seq` + two-pass `_patch_union_score_pass` (no_grad pass over *all* candidates captures layer-ℓ attention) | read heap → capture attn in the real forward → `_pu_commit` post-action write | `--mem-fs-select patch_union [--mem-fs-attn-layer 13 --mem-fs-diff-share 0.5]` | ⏳ training |
+| 3 | **Action-conditioned patch memory** (patch_union) | **novelty ∪ action-relevance**: token-space Δ top-(αM) **∪** DiT action→patch cross-attention top-((1−α)M) | **patch** | `_patch_union_mem_seq` + two-pass `_patch_union_score_pass` (no_grad pass over *all* candidates captures layer-ℓ attention) | read heap → capture attn in the real forward → `_pu_commit` post-action write | `--mem-fs-select patch_union [--mem-fs-attn-layer 13 --mem-fs-diff-share 0.5]` | ✅ **14.4 %** (V2 @50k) |
+| 3b | **Learned patch selection** (patch_union + `--mem-fs-learned-select`) | the same candidates, but the score is a **trained** head instead of a hand-written union — differentiable top-k via an additive `log α` attention bias | **patch** | `_learned_select_mem_seq`: `PatchScoreHead` → budgeted Soft-TopK → `log α` bias on the memory keys (all candidates stay in the KV) | one heap ranked by the learned score, entries **re-scored every call** (Δt drifts) | `--mem-fs-learned-select [--mem-fs-score-residual --mem-fs-anneal-steps 20000]` | ⚠️ diverged — see below |
 
 - **1 → 2** trades uniform coverage for event coverage: wins the event-sparse suites (Counting +11.0,
   Permanence +8.5) and loses the continuous-trajectory ones (Reference −6.5, Imitation −6.5). Uniform
@@ -114,6 +115,10 @@ which is historically mismatched — see caveats):
 - **2 → 3** drops the selection unit from frames to **patches** and adds a second, *task-conditioned*
   channel: the policy's own action queries vote on which patches matter. At the same 512-token budget a
   patch-level union spans ~120 timesteps instead of 8 frames.
+- **3 → 3b** asks whether the *rule* can be trained rather than written. It has to be: V2 tripled success
+  from 30k (4.6 %) to 50k (14.4 %) while the memory's geometry stayed bit-for-bit identical, so the
+  hand-written union is effectively a fixed heuristic that training cannot move. **Not yet working** —
+  see the divergence note under Method 5.
 
 - **Read-out size** — set by `--n-moment-tokens` (`n_q`): **4** (light; the ~18.4 baseline) or **128** (wide
   bank; tests token-count vs the pooling ceiling — scaling 32× barely helps, so the limit is the *pooling op*).
@@ -167,6 +172,11 @@ Everything is a flag on `gr00t/experiment/launch_finetune.py` (`gr00t/configs/fi
 | `--mem-fs-diff-share` | `0.5` | float | `patch_union` only — novelty-channel share of the patch budget (rest = relevance) |
 | `--mem-fs-tail-share` | `0.0` | float | `patch_union` only — tail_L15 3rd-channel share of the **non-novelty** budget (`0.0` = 2-way `nov∪act`; `0.5` = 3-way `nov∪act∪tail`) |
 | `--mem-fs-pos-rope` | `false` | flag | `patch_union` only — PPE-style 3D key-RoPE (Δt,y,x) on the stored memory tokens in the DiT cross-attention |
+| `--mem-fs-learned-select` | `false` | flag | `patch_union` only — train the selection instead of hand-writing it: `PatchScoreHead` → budgeted Soft-TopK → `log α` bias on the memory keys |
+| `--mem-fs-score-residual` | `false` | flag | learned-select warm-start safety — rank by the existing heuristic **plus** the zero-init head, so step 0 reproduces today's selection instead of a random one |
+| `--mem-fs-anneal-steps` | `20000` | int | horizon over which Soft-TopK τ goes 1.0 → 0.1 and the Gumbel scale 1.0 → 0 (soft training forward → hard deployment top-k) |
+| `--mem-fs-score-hidden` | `0` | int | score-head width; `0` = `backbone_embedding_dim // 8` |
+| `FS_SCORE_LR_MULT` (env) | `10` | float | score-head LR as a multiple of `--learning-rate`. The head's last layer is zero-init, so at 1× it barely moves in 60k steps; 100× (DynamicViT's number, but paired there with a **frozen, 0.01×** backbone) diverges here |
 | `--mem-film-layers` | `all` | `all`/`mid`/`8,10,12`/`8-20` | FiLM injection depth (`modul` only) |
 | `--mem-image-side` | `False` | bool | route memory tokens via IMAGE (vs TEXT) cross-attn pathway (`cross_attn` only) |
 | `--load-moment-tokens-from` | `None` | path | warm-start moment tokens from a Stage-1 TCL checkpoint |
@@ -297,6 +307,41 @@ cross-attn call per DiT block; `modul` adds a second and breaks the layer counte
   #     the token but the attention has no RoPE to exploit it). Keys-only rotation, K=1.
   --mem-fs-pos-rope
 ```
+
+⚠️ **The command above runs effective batch 64, not 32.** `per_device = global_batch_size / num_gpus`
+and `gradient_accumulation_steps` multiplies on top (`experiment.py:197`), so `--global-batch-size 32
+--gradient-accumulation-steps 2` on 4 GPUs is 8 × 4 × 2. The other arms ran 32 (`--global-batch-size 8
+--gradient-accumulation-steps 4`). Match it before comparing, or record the deviation.
+
+#### Learned selection (`--mem-fs-learned-select`) — implemented, **not yet converging**
+
+Replaces the hand-written `novelty ∪ act` union with a trained `PatchScoreHead`. The gate is a budgeted
+Soft-TopK whose `log α` enters the DiT cross-attention as an additive bias, which makes `α = 0` exactly
+equivalent to deleting the key (verified: gated-full vs physically sliced forward agree to 1.3e-7), so the
+soft training forward converges to the hard top-512 used at deployment as τ anneals.
+
+```bash
+  --mem-fs-select patch_union --mem-fs-learned-select --mem-fs-score-residual \
+  --mem-fs-anneal-steps 20000 --mem-fs-pos-rope \
+  --base-model-path <patch_union V2 ckpt>      # warm start; cold start begins at loss ~1.2, not ~0.01
+```
+
+**Status: the score head diverges.** At the inherited 100× head LR the LayerNorm weight went 1 → 88 by
+10k steps, α saturated, loss parked at 0.34 and grad_norm reached 1e9; at 10× it took the same path more
+slowly (loss climbing monotonically from step 400, blow-up by 5.3k). Root cause: `α = σ((b−λ)/τ)` gets
+sharper as `|b|` grows, and a sharper gate looks more like the deployment top-k, so **every increase in
+weight magnitude is rewarded, without bound** — while the heuristic baseline it is added to *is*
+z-scored, so the head can simply outgrow the prior it was meant to correct. Fix under test: standardise
+the combined logits before the gate, making α invariant to `|b|` so sharpness is set only by the τ anneal
+(unit-tested: α identical at weight scale 1 and 88; hard top-k unchanged, so train/deploy stay aligned).
+
+Two operational notes bought the hard way:
+
+- `FS_GRAD_PROBE` must stay 0 on any multi-GPU run. Reading ZeRO gradients needs a collective per
+  parameter, and issuing those from inside `training_step` deadlocks every rank before step 1.
+- A supervisor loop that only retries turns a hard failure into an invisible burn — 61 restarts, zero
+  training steps. Give it a definition of progress and a condition to give up. When a distributed job
+  hangs, `py-spy dump --pid <rank>` names the line in seconds; inferring from symptoms does not.
 
 Both round-trip through the ckpt config; on an old ckpt override at eval with
 `run_gr00t_server.py --mem-fs-tail-share 0.5 --mem-fs-pos-rope`. Files:

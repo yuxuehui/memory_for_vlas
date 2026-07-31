@@ -640,6 +640,20 @@ class Gr00tN1d6ActionHead(nn.Module):
                     base = base + _zscore(self._pu_rel.to(base.device).float())
             logits = logits + base.to(logits.dtype)
 
+        # Scale-normalise before the gate. Without this the head has a degenerate way to lower
+        # the loss: alpha = sigmoid((b - lambda)/tau) gets SHARPER as |b| grows, and a sharper
+        # gate makes the training forward look more like the hard top-k used at deployment, so
+        # every increase in weight magnitude is rewarded a little -- with no upper bound. That
+        # is what training measured: from step 400 the loss climbed monotonically (0.0076 ->
+        # 0.037 by 3.9k) while fs_score_head.norm.weight crept 1.00 -> 1.18, then both ran away
+        # (loss 0.30, grad_norm 4.6e3, norm.weight 1.75 by 5.3k; at the original 100x LR the
+        # LayerNorm weight reached 88). Standardising per sample makes the gate invariant to
+        # |b|, so sharpness is controlled ONLY by the tau anneal, as designed. It also puts the
+        # head's logits on the same scale as the z-scored heuristic baseline above, which they
+        # were never on -- the head could simply outgrow the prior it was meant to correct.
+        # Monotone per sample, so hard_topk below is unaffected: train and deploy stay aligned.
+        logits = _zscore(logits)
+
         if not self.training:
             keep_idx = torch.topk(hard_topk(logits, budget) * 1.0 + logits * 1e-6,
                                   budget, dim=1).indices.sort(dim=1).values

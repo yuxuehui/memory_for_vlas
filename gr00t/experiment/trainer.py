@@ -209,7 +209,10 @@ class Gr00tTrainer(Trainer):
         """
         if self.optimizer is not None:
             return self.optimizer
-        mult = float(os.environ.get("FS_SCORE_LR_MULT", "100"))
+        # 100 is DynamicViT's number, but it pairs that with a FROZEN, 0.01x backbone. At our
+        # base lr 1e-4 it puts a 1.25M MLP with a LayerNorm at 1e-2 and the head diverges
+        # (norm.weight 1 -> 88 by 10k). 10x still lets a zero-init head move in 60k steps.
+        mult = float(os.environ.get("FS_SCORE_LR_MULT", "10"))
         head = [(n, p) for n, p in self.model.named_parameters()
                 if p.requires_grad and "fs_score_head" in n]
         if not head or mult == 1.0:
@@ -296,7 +299,7 @@ class Gr00tTrainer(Trainer):
                         logging.warning(
                             "[fs_score_head] norm.weight |max|=%.3g has left [0.5, 2] — the head "
                             "is diverging. Lower FS_SCORE_LR_MULT (currently %s).",
-                            m, os.environ.get("FS_SCORE_LR_MULT", "100"),
+                            m, os.environ.get("FS_SCORE_LR_MULT", "10"),
                         )
                     return
         except Exception:
