@@ -404,27 +404,23 @@ not directly comparable.)
 
 ### 5b. Keyframe-selection A/B (all @60k, 16 tasks × 50 eps = 800 episodes each)
 
-Measured on the *same* pipeline, all at K=8 / `cross_attn` / `memory_type moment_token`.
-**The equal-budget control covers the three *selection* arms only** — framesamp, tokendrop and
-patch_union each put `--mem-framesamp-budget` = **512 patch tokens** into the DiT KV, so comparing them
-isolates **selection only**. (vanilla = K=4 no-memory control.)
+Same pipeline throughout, all at K=8 / `cross_attn` / `memory_type moment_token`; vanilla is the K=4
+no-memory control. **The equal-budget control covers the three *selection* arms only** — framesamp,
+tokendrop and patch_union each place `--mem-framesamp-budget` = 512 patch tokens in the DiT KV, so
+comparing those three isolates **selection** and nothing else.
 
-⚠️ **HAMLET is not in that control, and reading its column as "loses to patch_union at equal budget" is
-wrong.** Its read-out compresses the K·n_q = 8×4 = 32 moment tokens of history and replaces the current
-step's tail, so what actually reaches the KV is **`n_q` = 4 tokens** — the selection arms use **512**, a
-128× larger footprint (`gr00t_n1d6.py:1511`, where framesamp tokens replace the n_q tail and the KV grows
-n_q → M). The honest reading of the row is that a 4-token read-out **matches** a 512-token patch memory
-(17.2 vs 17.25). Per-step KV contribution:
+⚠️ **HAMLET is not inside that control.** Its aggregator *consumes* K·n_q = 8×4 = 32 moment tokens of
+history but the caller keeps only the last `n_q` rows (`mem_out[:, -v_nq:, :]`,
+[`gr00t_n1d6.py:930`](gr00t/model/gr00t_n1d6/gr00t_n1d6.py#L930)), so **4 tokens** reach the KV where the
+selection arms put **512** — a 128× difference in footprint.
 
-| arm | KV tokens from memory | what they are |
-|---|--:|---|
-| HAMLET (read-out) | **4** | aggregator output over 32 moment tokens of history |
-| FrameSamp / TokenDrop / patch_union | **512** | raw patch tokens selected from 8 candidate frames |
+| arm | consumed by the aggregator | **reaching the DiT KV** |
+|---|--:|--:|
+| HAMLET (read-out) | 32 moment tokens (8 steps × 4) | **4** |
+| FrameSamp / TokenDrop / patch_union | — | **512** raw patch tokens |
 
-注意：
-* HAMLET:MemoryTransformer 把 K×n_q = 8×4 = 32 个 moment token 的历史压缩掉,然后 replaces the current step's tail —— 塞进 KV 的只有 n_q = 4 个 token;
-* FrameSamp / TokenDrop / patch_union:framesamp token 替换掉那 4 个 moment tail,M = --mem-framesamp-budget = 512 个 token 进 KV(gr00t_n1d6.py:1511)。
-
+So the row does **not** say "patch_union edges out HAMLET". It says a **4-token read-out matches a
+512-token patch memory** (17.2 vs 17.25, both z≈5.4 over vanilla) — which is the more interesting result.
 
 | suite | vanilla | HAMLET (K=8) | FrameSamp (uniform) | TokenDrop (diff) | patch_union (V2) |
 |---|--:|--:|--:|--:|--:|
@@ -435,31 +431,36 @@ n_q → M). The honest reading of the row is that a 4-token read-out **matches**
 | **OVERALL** | **8.2** | **17.2** | **12.4** | **14.0** | **17.25** |
 | vs vanilla (z) | — | +5.40 | +2.71 | +3.66 | +5.43 |
 
-`patch_union` matches the other memory arms on K=8 / budget 512 / `cross_attn`, so the columns are
-comparable on selection. Two caveats before reading it as the winner: it ties HAMLET rather than beating
-it (17.25 vs 17.2, and both sit at z≈5.4 over vanilla), and **`patch_union` vs `tokendrop` is +3.25 at
-z=+1.79, two-sided p≈0.073 — not significant.** ⚠️ Its published training command also runs **effective
-batch 64** where the other arms ran 32 (see Method 5), so the arm may not be batch-matched.
+Reading the numbers:
 
-Per-task winners: HAMLET 8 · patch_union 7 · framesamp 5 · tokendrop 2 · vanilla 1. **每个套件的赢家都不同**, and the
-win pattern tracks the *instruction semantics*:
+- **patch_union vs tokendrop is +3.25 at z=+1.79, two-sided p≈0.073 — not significant.** Direction stable
+  (wins 3 of 4 suites), significance not reached; both curves are flattening by 60k, so closing it needs
+  more eval episodes, not more training steps.
+- ⚠️ patch_union ran **effective batch 64** where the other arms ran 32 (confirmed from its
+  `training_args.bin`; see Method 5), so it is **not batch-matched** to them.
+- **tokendrop's suite split is significant in both directions**: Counting +11.0 (z=+3.17), Permanence
+  +8.5 (z=+2.36), Reference −6.5 (z=−2.06), Imitation −6.5 (z=−1.98). Its OVERALL +1.6 is not (z=0.96).
+
+Per-task winners: HAMLET 8 · patch_union 7 · framesamp 5 · tokendrop 2 · vanilla 1
+([§5c](#5c-per-task-results-with-instructions)). **每个套件的赢家都不同**, and the pattern tracks the
+*instruction semantics*:
 
 - `"repeating X times"` (counting) → **HAMLET** (PickXtimes 38, SwingXtimes 32) — counting is *drift*
   content needing an accumulated state; snapshots don't carry it (note-20 drift-invisibility).
-- `"hiding the X cube"` (permanence) → **tokendrop** (VideoUnmask 46 = single best cell in the table) —
-  the evidence is one instantaneous event, exactly what a pixel-diff peak captures.
+- `"hiding the X cube"` (permanence) → **patch_union** (24.5) and **tokendrop** (VideoUnmask 46, the single
+  best cell in the table) — the evidence is one instantaneous event, exactly what a diff peak captures, and
+  patch-level selection keeps it at finer grain.
 - `"in the same manner / same path"` (continuous imitation) → **framesamp** (RouteStick 34, PatternLock 14) —
-  trajectory *shape* needs dense uniform coverage; diff keeps only peaks and drops the manner in between.
-- `"right after / the first target"` (ordering) → HAMLET/framesamp; tokendrop collapses (VideoPlaceOrder 24→8)
-  because sparse event frames carry no ordinality.
+  trajectory *shape* needs dense uniform coverage. **patch_union scores 4.5 here, identical to no memory at
+  all**, and is the only arm at 0 on both RouteStick and PatternLock: selecting salient patches discards
+  precisely the in-between motion that defines "manner".
+- `"right after / the first target"` (ordering) → HAMLET/framesamp; tokendrop collapses (VideoPlaceOrder
+  24→8) because sparse event frames carry no ordinality.
 
-**tokendrop suite split is significant in both directions**: Counting +11.0 (z=+3.17), Permanence +8.5
-(z=+2.36), Reference −6.5 (z=−2.06), Imitation −6.5 (z=−1.98); OVERALL +1.6 is **not** significant (z=0.96).
-Per-task numbers: [§5c](#5c-per-task-results-with-instructions).
-
-⇒ **No single selection rule dominates**; uniform sampling is the correct prior for *continuous* content and
-diff is the correct prior for *event* content — motivating a hybrid budget (diff peaks + uniform + compressed
-drift) rather than an either/or.
+⇒ **No single selection rule dominates.** Uniform sampling is the correct prior for *continuous* content,
+diff/patch selection for *event* content — motivating a hybrid budget (diff peaks + uniform + compressed
+drift) rather than an either/or. And the 4-vs-512 token gap says the compressed read-out is doing
+something the raw-patch arms are not yet buying with 128× the KV.
 
 ---
 
