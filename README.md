@@ -404,8 +404,27 @@ not directly comparable.)
 
 ### 5b. Keyframe-selection A/B (all @60k, 16 tasks × 50 eps = 800 episodes each)
 
-Measured on the *same* pipeline; the three memory arms share K=8 / budget 512 / `cross_attn`, so
-framesamp↔tokendrop isolates **selection only**. (vanilla = K=4 no-memory control.)
+Measured on the *same* pipeline, all at K=8 / `cross_attn` / `memory_type moment_token`.
+**The equal-budget control covers the three *selection* arms only** — framesamp, tokendrop and
+patch_union each put `--mem-framesamp-budget` = **512 patch tokens** into the DiT KV, so comparing them
+isolates **selection only**. (vanilla = K=4 no-memory control.)
+
+⚠️ **HAMLET is not in that control, and reading its column as "loses to patch_union at equal budget" is
+wrong.** Its read-out compresses the K·n_q = 8×4 = 32 moment tokens of history and replaces the current
+step's tail, so what actually reaches the KV is **`n_q` = 4 tokens** — the selection arms use **512**, a
+128× larger footprint (`gr00t_n1d6.py:1511`, where framesamp tokens replace the n_q tail and the KV grows
+n_q → M). The honest reading of the row is that a 4-token read-out **matches** a 512-token patch memory
+(17.2 vs 17.25). Per-step KV contribution:
+
+| arm | KV tokens from memory | what they are |
+|---|--:|---|
+| HAMLET (read-out) | **4** | aggregator output over 32 moment tokens of history |
+| FrameSamp / TokenDrop / patch_union | **512** | raw patch tokens selected from 8 candidate frames |
+
+注意：
+* HAMLET:MemoryTransformer 把 K×n_q = 8×4 = 32 个 moment token 的历史压缩掉,然后 replaces the current step's tail —— 塞进 KV 的只有 n_q = 4 个 token;
+* FrameSamp / TokenDrop / patch_union:framesamp token 替换掉那 4 个 moment tail,M = --mem-framesamp-budget = 512 个 token 进 KV(gr00t_n1d6.py:1511)。
+
 
 | suite | vanilla | HAMLET (K=8) | FrameSamp (uniform) | TokenDrop (diff) | patch_union (V2) |
 |---|--:|--:|--:|--:|--:|
