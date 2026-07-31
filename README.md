@@ -286,8 +286,16 @@ torchrun --nproc_per_node=4 --master_port=29500 gr00t/experiment/launch_finetune
   --memory-type moment_token --no-freeze-moment-tokens \
   --max-steps 60000 --save-steps 10000 --save-total-limit 10 --output-dir runs/robomme/patch_union \
   --mem-cond-type cross_attn --mem-source framesamp --mem-framesamp-frames 8 --mem-framesamp-budget 512 \
-  --mem-fs-select patch_union --mem-fs-attn-layer 13 --mem-fs-diff-share 0.5 --mem-fs-diff-stride 8
+  --mem-fs-select patch_union --mem-fs-attn-layer 13 --mem-fs-diff-share 0.5 --mem-fs-diff-stride 8 \
+  --mem-fs-pos-rope
 ```
+
+This is the **exact V2 @60k configuration** (17.25 %), read back from
+`exp_patchunion/patch_union_causal_rope/checkpoint-60000`: `mem_fs_pos_rope=True`,
+`mem_fs_tail_share=0.0` (2-way `novelty ∪ act`, no tail channel), `mem_fs_attn_layer=13`,
+`mem_fs_diff_share=0.5`, `mem_fs_diff_stride=8`, `memory_window=8`, `mem_window_mode=recent`,
+`n_moment_tokens=4`. "V2" also means the **causal** candidate frames — a loader fix, not a flag
+(`_fs_pu_indices`); v1's acausal linspace let training see frames the inference selector never can.
 `patch_union` currently supports **`--mem-cond-type cross_attn` only** (the sdpa capture counts one
 cross-attn call per DiT block; `modul` adds a second and breaks the layer counter — asserted in code).
 
@@ -305,10 +313,11 @@ cross-attn call per DiT block; `modul` adds a second and breaks the layer counte
   --mem-fs-pos-rope
 ```
 
-⚠️ **The command above runs effective batch 64, not 32.** `per_device = global_batch_size / num_gpus`
-and `gradient_accumulation_steps` multiplies on top (`experiment.py:197`), so `--global-batch-size 32
---gradient-accumulation-steps 2` on 4 GPUs is 8 × 4 × 2. The other arms ran 32 (`--global-batch-size 8
---gradient-accumulation-steps 4`). Match it before comparing, or record the deviation.
+⚠️ **This runs effective batch 64, not 32** — confirmed from the checkpoint's `training_args.bin`
+(`per_device_train_batch_size=8`, `world_size=4`, `gradient_accumulation_steps=2`). `per_device =
+global_batch_size / num_gpus` and `gradient_accumulation_steps` multiplies on top
+(`experiment.py:197`). The other arms ran 32, so **the 17.25 % is not batch-matched to them**; use
+`--global-batch-size 8 --gradient-accumulation-steps 4` for a matched run, or record the deviation.
 Both round-trip through the ckpt config; on an old ckpt override at eval with
 `run_gr00t_server.py --mem-fs-tail-share 0.5 --mem-fs-pos-rope`. Files:
 `modules/fs_pos_rope.py` (3D RoPE math), rotation folded into `modules/fs_patch_union.py`'s
@@ -398,16 +407,22 @@ not directly comparable.)
 Measured on the *same* pipeline; the three memory arms share K=8 / budget 512 / `cross_attn`, so
 framesamp↔tokendrop isolates **selection only**. (vanilla = K=4 no-memory control.)
 
-| suite | vanilla | HAMLET (K=8) | FrameSamp (uniform) | TokenDrop (diff) |
-|---|--:|--:|--:|--:|
-| Counting | 13.0 | **25.5** | 8.5 | 19.5 |
-| Permanence | 5.0 | 18.0 | 11.0 | **19.5** |
-| Reference | 10.5 | **18.0** | 14.5 | 8.0 |
-| Imitation | 4.5 | 7.5 | **15.5** | 9.0 |
-| **OVERALL** | **8.2** | **17.2** | **12.4** | **14.0** |
-| vs vanilla (z) | — | +5.40 | +2.71 | +3.66 |
+| suite | vanilla | HAMLET (K=8) | FrameSamp (uniform) | TokenDrop (diff) | patch_union (V2) |
+|---|--:|--:|--:|--:|--:|
+| Counting | 13.0 | **25.5** | 8.5 | 19.5 | 22.0 |
+| Permanence | 5.0 | 18.0 | 11.0 | 19.5 | **24.5** |
+| Reference | 10.5 | **18.0** | 14.5 | 8.0 | **18.0** |
+| Imitation | 4.5 | 7.5 | **15.5** | 9.0 | 4.5 |
+| **OVERALL** | **8.2** | **17.2** | **12.4** | **14.0** | **17.25** |
+| vs vanilla (z) | — | +5.40 | +2.71 | +3.66 | +5.43 |
 
-Per-task winners: HAMLET 10 · framesamp 5 · tokendrop 2 · vanilla 1. **每个套件的赢家都不同**, and the
+`patch_union` matches the other memory arms on K=8 / budget 512 / `cross_attn`, so the columns are
+comparable on selection. Two caveats before reading it as the winner: it ties HAMLET rather than beating
+it (17.25 vs 17.2, and both sit at z≈5.4 over vanilla), and **`patch_union` vs `tokendrop` is +3.25 at
+z=+1.79, two-sided p≈0.073 — not significant.** ⚠️ Its published training command also runs **effective
+batch 64** where the other arms ran 32 (see Method 5), so the arm may not be batch-matched.
+
+Per-task winners: HAMLET 8 · patch_union 7 · framesamp 5 · tokendrop 2 · vanilla 1. **每个套件的赢家都不同**, and the
 win pattern tracks the *instruction semantics*:
 
 - `"repeating X times"` (counting) → **HAMLET** (PickXtimes 38, SwingXtimes 32) — counting is *drift*
@@ -434,26 +449,28 @@ drift) rather than an either/or.
 Same runs as §5b. The **example instruction** column is what makes the pattern legible: the winning memory
 tracks the *semantics of the task*, not a single global ranking.
 
-| suite | task | vanilla | HAMLET | FrameSamp | TokenDrop | example instruction |
-|---|---|---:|---:|---:|---:|---|
-| Counting | **BinFill** | 8.0 | **24.0** | 6.0 | 18.0 | put one red cube into the bin, then press the button to stop |
-| Counting | **PickXtimes** | 20.0 | **38.0** | 4.0 | 24.0 | pick up the green cube and place it on the target, repeating this action **three times**, then press the button to stop |
-| Counting | **StopCube** | **10.0** | 8.0 | **10.0** | 8.0 | press the button to stop the cube just as it reaches the target for the **fourth time** |
-| Counting | **SwingXtimes** | 14.0 | **32.0** | 14.0 | 28.0 | move the cube right-side → left-side target, repeating **two times**, finally press the button to stop |
-| Permanence | **ButtonUnmask** | 4.0 | **20.0** | 6.0 | 12.0 | first press the button, then pick up the container **hiding the red cube** |
-| Permanence | **ButtonUnmaskSwap** | 0.0 | **16.0** | 0.0 | 0.0 | press both buttons, then pick up the container hiding the blue cube, finally another hiding the green cube |
-| Permanence | **VideoUnmask** | 10.0 | 14.0 | 24.0 | **46.0** | watch the video carefully, then pick up the container hiding the green cube |
-| Permanence | **VideoUnmaskSwap** | 6.0 | **22.0** | 14.0 | 20.0 | watch the video, pick up the container hiding the green cube, finally another hiding the blue cube |
-| Reference | **PickHighlight** | 6.0 | **16.0** | 6.0 | 8.0 | first press the button, then pick up all cubes that **have been highlighted** with white areas |
-| Reference | **VideoPlaceButton** | 16.0 | **26.0** | **26.0** | 16.0 | watch the video, then place the green cube on the target **right after the button was pressed** |
-| Reference | **VideoPlaceOrder** | 20.0 | 20.0 | **24.0** | 8.0 | watch the video, then place the red cube on the **first** target it was previously placed on |
-| Reference | **VideoRepick** | 0.0 | **10.0** | 2.0 | 0.0 | watch the video, repeatedly pick up/put down the **same block** three times, finally press the button |
-| Imitation | **InsertPeg** | 0.0 | **4.0** | 0.0 | 2.0 | watch the video, grasp the **same end of the same peg** and insert into the **same side** of the box |
-| Imitation | **MoveCube** | 12.0 | 18.0 | 14.0 | **24.0** | watch the video, then move the cube to the target **in the same manner as before** |
-| Imitation | **PatternLock** | 0.0 | 4.0 | **14.0** | 6.0 | watch the video, then use the stick to **retrace the same pattern** |
-| Imitation | **RouteStick** | 6.0 | 4.0 | **34.0** | 4.0 | watch the video, then navigate around the sticks **following the same path** |
+| suite | task | vanilla | HAMLET | FrameSamp | TokenDrop | patch_union | example instruction |
+|---|---|---:|---:|---:|---:|---:|---|
+| Counting | **BinFill** | 8.0 | **24.0** | 6.0 | 18.0 | 12.0 | put one red cube into the bin, then press the button to stop |
+| Counting | **PickXtimes** | 20.0 | **38.0** | 4.0 | 24.0 | 34.0 | pick up the green cube and place it on the target, repeating this action **three times**, then press the button to stop |
+| Counting | **StopCube** | **10.0** | 8.0 | **10.0** | 8.0 | **10.0** | press the button to stop the cube just as it reaches the target for the **fourth time** |
+| Counting | **SwingXtimes** | 14.0 | **32.0** | 14.0 | 28.0 | **32.0** | move the cube right-side → left-side target, repeating **two times**, finally press the button to stop |
+| Permanence | **ButtonUnmask** | 4.0 | **20.0** | 6.0 | 12.0 | **20.0** | first press the button, then pick up the container **hiding the red cube** |
+| Permanence | **ButtonUnmaskSwap** | 0.0 | **16.0** | 0.0 | 0.0 | 10.0 | press both buttons, then pick up the container hiding the blue cube, finally another hiding the green cube |
+| Permanence | **VideoUnmask** | 10.0 | 14.0 | 24.0 | **46.0** | **46.0** | watch the video carefully, then pick up the container hiding the green cube |
+| Permanence | **VideoUnmaskSwap** | 6.0 | **22.0** | 14.0 | 20.0 | **22.0** | watch the video, pick up the container hiding the green cube, finally another hiding the blue cube |
+| Reference | **PickHighlight** | 6.0 | 16.0 | 6.0 | 8.0 | **18.0** | first press the button, then pick up all cubes that **have been highlighted** with white areas |
+| Reference | **VideoPlaceButton** | 16.0 | **26.0** | **26.0** | 16.0 | 24.0 | watch the video, then place the green cube on the target **right after the button was pressed** |
+| Reference | **VideoPlaceOrder** | 20.0 | 20.0 | **24.0** | 8.0 | 18.0 | watch the video, then place the red cube on the **first** target it was previously placed on |
+| Reference | **VideoRepick** | 0.0 | 10.0 | 2.0 | 0.0 | **12.0** | watch the video, repeatedly pick up/put down the **same block** three times, finally press the button |
+| Imitation | **InsertPeg** | 0.0 | **4.0** | 0.0 | 2.0 | 2.0 | watch the video, grasp the **same end of the same peg** and insert into the **same side** of the box |
+| Imitation | **MoveCube** | 12.0 | 18.0 | 14.0 | **24.0** | 16.0 | watch the video, then move the cube to the target **in the same manner as before** |
+| Imitation | **PatternLock** | 0.0 | 4.0 | **14.0** | 6.0 | 0.0 | watch the video, then use the stick to **retrace the same pattern** |
+| Imitation | **RouteStick** | 6.0 | 4.0 | **34.0** | 4.0 | 0.0 | watch the video, then navigate around the sticks **following the same path** |
 
-Per-task winners: HAMLET 10 · FrameSamp 5 · TokenDrop 2 · vanilla 1 (ties counted for each).
+Per-task winners: HAMLET 8 · **patch_union 7** · FrameSamp 5 · TokenDrop 2 · vanilla 1 (ties counted for
+each). patch_union's wins are concentrated in Permanence and Reference; it is the only arm scoring **0**
+on both PatternLock and RouteStick — the two pure trajectory-imitation tasks FrameSamp wins outright.
 
 ---
 
