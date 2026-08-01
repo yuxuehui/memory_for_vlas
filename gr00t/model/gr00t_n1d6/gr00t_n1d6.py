@@ -618,7 +618,11 @@ class Gr00tN1d6ActionHead(nn.Module):
         zg = zg.unsqueeze(2).expand(B, Fn, n_img, zg.shape[-1]).reshape(B, N, -1)
         logits = head.score(zl, zg, pos)                             # (B, N)
 
-        if self.mem_fs_score_residual:
+        _res_w = (
+            anneal(self._fs_gate_step, self.mem_fs_anneal_steps, 1.0, 0.0)
+            if (self.mem_fs_score_residual and self.training) else 0.0
+        )
+        if _res_w > 0.0:
             # Warm-start safety. The head's last layer is zero-init, so on its own it emits a
             # CONSTANT score -- with Gumbel noise that is a uniformly random subset, i.e. a
             # warm-started run would hand a random memory to a DiT already trained on a good
@@ -638,17 +642,13 @@ class Gr00tN1d6ActionHead(nn.Module):
                 base = _zscore(nov.reshape(B, N))
                 if self._pu_rel is not None and self._pu_rel.shape[-1] == N:
                     base = base + _zscore(self._pu_rel.to(base.device).float())
-            # The base DECAYS with the anneal, because deployment has no residual: the running
-            # heap ranks by head.score alone (LearnedPatchSelector._scores — it cannot see the
-            # previous frame, so it cannot compute novelty, and there is no captured attention
-            # channel either). A constant base would train selection = rank(head + base) and
-            # deploy selection = rank(head) — the same train/deploy divergence that sank
-            # patch_union v1. Decaying it keeps the warm-start property (step 0 ≈ today's
-            # heuristic) while the ranking the loss shapes converges to the one that ships.
-            if self.training:
-                w = anneal(self._fs_gate_step, self.mem_fs_anneal_steps, 1.0, 0.0)
-                logits = logits + w * base.to(logits.dtype)
-            # eval: head-only, matching the deployed heap.
+            # The base DECAYS with the anneal (weight computed above), because deployment has
+            # no residual: the running heap ranks by head.score alone (it cannot see the
+            # previous frame, so it can never compute novelty, and there is no captured
+            # attention channel either). A constant base would train selection = rank(head +
+            # base) and deploy selection = rank(head) — the divergence that sank patch_union
+            # v1. Eval adds nothing: head-only, matching the deployed heap.
+            logits = logits + _res_w * base.to(logits.dtype)
 
         # Scale-normalise before the gate. Without this the head has a degenerate way to lower
         # the loss: alpha = sigmoid((b - lambda)/tau) gets SHARPER as |b| grows, and a sharper
@@ -831,6 +831,21 @@ class Gr00tN1d6ActionHead(nn.Module):
         clear_rope()
 
     @torch.no_grad()
+
+    def _pu_score_pass_needed(self) -> bool:
+        """Pass A is a full no_grad DiT forward over every candidate; under learned selection
+        its ONLY consumer is the warm-start residual prior, whose weight anneals to zero. Once
+        the prior is gone (or at eval, which is head-only by design), the pass is pure waste --
+        two thirds of a 60k run at one extra DiT forward per step. The heuristic patch_union
+        path still needs it unconditionally: the act channel selects with it."""
+        if not getattr(self, "mem_fs_learned_select", False):
+            return True
+        return (
+            self.training
+            and self.mem_fs_score_residual
+            and self._fs_gate_step < self.mem_fs_anneal_steps
+        )
+
     def _patch_union_score_pass(self, backbone_output, action_input):
         """Pass A: assemble the KV with ALL candidate patch tokens, run ONE DiT forward at a
         fixed timestep, and return the captured action->candidate cross-attention (B, n_cand).
@@ -1715,7 +1730,10 @@ class Gr00tN1d6ActionHead(nn.Module):
         if self.mem_fs_select == "patch_union" and self.mem_source == "framesamp":
             # Pass A (no_grad): score every candidate patch by the DiT's own action->patch
             # cross-attention, then pass B below selects the union top-budget with it.
-            self._pu_rel = self._patch_union_score_pass(backbone_output, action_input)
+            self._pu_rel = (
+                self._patch_union_score_pass(backbone_output, action_input)
+                if self._pu_score_pass_needed() else None
+            )
         backbone_output = self.process_backbone_output(backbone_output, action_inputs_B=B_target)
 
         # Get vision and language embeddings.
@@ -1840,7 +1858,10 @@ class Gr00tN1d6ActionHead(nn.Module):
         """
         B_target = action_input.state.shape[0]
         if self.mem_fs_select == "patch_union" and self.mem_source == "framesamp":
-            self._pu_rel = self._patch_union_score_pass(backbone_output, action_input)
+            self._pu_rel = (
+                self._patch_union_score_pass(backbone_output, action_input)
+                if self._pu_score_pass_needed() else None
+            )
         backbone_output = self.process_backbone_output(
             backbone_output, action_inputs_B=B_target, reset_memory=reset_memory
         )
