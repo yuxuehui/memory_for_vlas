@@ -638,7 +638,17 @@ class Gr00tN1d6ActionHead(nn.Module):
                 base = _zscore(nov.reshape(B, N))
                 if self._pu_rel is not None and self._pu_rel.shape[-1] == N:
                     base = base + _zscore(self._pu_rel.to(base.device).float())
-            logits = logits + base.to(logits.dtype)
+            # The base DECAYS with the anneal, because deployment has no residual: the running
+            # heap ranks by head.score alone (LearnedPatchSelector._scores — it cannot see the
+            # previous frame, so it cannot compute novelty, and there is no captured attention
+            # channel either). A constant base would train selection = rank(head + base) and
+            # deploy selection = rank(head) — the same train/deploy divergence that sank
+            # patch_union v1. Decaying it keeps the warm-start property (step 0 ≈ today's
+            # heuristic) while the ranking the loss shapes converges to the one that ships.
+            if self.training:
+                w = anneal(self._fs_gate_step, self.mem_fs_anneal_steps, 1.0, 0.0)
+                logits = logits + w * base.to(logits.dtype)
+            # eval: head-only, matching the deployed heap.
 
         # Scale-normalise before the gate. Without this the head has a degenerate way to lower
         # the loss: alpha = sigmoid((b - lambda)/tau) gets SHARPER as |b| grows, and a sharper
@@ -666,7 +676,12 @@ class Gr00tN1d6ActionHead(nn.Module):
         step, total = self._fs_gate_step, self.mem_fs_anneal_steps
         tau = anneal(step, total, *self.mem_fs_gate_tau)
         gs = anneal(step, total, *self.mem_fs_gumbel)
-        self._fs_gate_step = step + 1
+        # The trainer stamps global_step here every optimizer step (_fs_gate_ext). The
+        # self-increment fallback counts FORWARDS, i.e. micro-batches: under gradient
+        # accumulation it runs the anneal accum-times too fast, and it resets to 0 on resume —
+        # τ snapping back to 1.0 and full Gumbel noise returning mid-run after every restart.
+        if not getattr(self, "_fs_gate_ext", False):
+            self._fs_gate_step = step + 1
         alpha = soft_topk(gumbel_perturb(logits, gs), budget, tau)   # (B, N), sum == budget
         self._pu_alpha = alpha_to_bias(alpha, flat_all.dtype)
         if self.mem_fs_pos_rope:

@@ -252,6 +252,21 @@ class Gr00tTrainer(Trainer):
         refuses to run distributed rather than offering a version that hangs. Reproduce the
         gradient question on one GPU, where it is safe.
         """
+        # Drive the learned-select anneal from global_step, not the module's own forward
+        # counter: forwards run once per MICRO-batch, so under gradient accumulation the
+        # self-counted anneal completes accum-times early (20000 -> 5000 optimizer steps at
+        # accum 4), and the counter is not checkpointed, so every resume snapped τ back to 1.0
+        # and re-injected full Gumbel noise. global_step is restored on resume, fixing both.
+        if getattr(self, "_fs_gate_module", None) is None:
+            for m in self.model.modules():
+                if hasattr(m, "_fs_gate_step"):
+                    self._fs_gate_module = m
+                    break
+            else:
+                self._fs_gate_module = False
+        if self._fs_gate_module:
+            self._fs_gate_module._fs_gate_step = int(self.state.global_step)
+            self._fs_gate_module._fs_gate_ext = True
         loss = super().training_step(*args, **kwargs)
         n = int(os.environ.get("FS_GRAD_PROBE", "0"))
         if n <= 0 or self.state.global_step % n != 0:
