@@ -18,6 +18,10 @@
 #      sudo mkfs.ext4 -F /dev/nvme0n1 && sudo mkdir -p /mnt/data && sudo mount /dev/nvme0n1 /mnt/data
 #      cp -r $W/robomme /mnt/data/robomme     # ~5.5 min for 121G
 # 4. --no-save-only-model, or resume silently restarts from scratch (df8453b).
+# 5. save-total-limit must fit the BOOT DISK: full checkpoints are ~37G each, so limit 10 at
+#    save-steps 2000 is 370G — plus the 121G dataset copy the image carries, that filled the
+#    500G disk at step 18000 mid-write (corrupting the checkpoint) and killed the run. Limit 4
+#    caps local checkpoints at ~148G; the GCS sync loop keeps the full history.
 #
 # When a multi-GPU job hangs: `py-spy dump --pid <rank pid>` FIRST. It named the offending line
 # in seconds. Inferring from symptoms cost two hours and sent me down an I/O dead end.
@@ -66,7 +70,7 @@ for i in $(seq 1 200); do
     --hamlet-mode finetune --learning-rate 1e-4 --max-grad-norm 1.0 --tune-top-llm-layers 4 \
     --n-moment-tokens 4 --memory-window 8 --memory-stride 16 --memory-num-layers 2 \
     --memory-type moment_token --no-freeze-moment-tokens \
-    --max-steps 60000 --save-steps 2000 --save-total-limit 10 \
+    --max-steps 60000 --save-steps 2000 --save-total-limit 4 \
     --output-dir "$OUT" \
     --mem-cond-type cross_attn --mem-source framesamp --mem-framesamp-frames 8 \
     --mem-framesamp-budget 512 \
@@ -79,3 +83,8 @@ done
 
 gsutil -m -q rsync -r "$OUT" "$BUCKET" || true
 echo "=== finished $(date -Is)"
+# Whether we got here by finishing or by the zero-progress abort, the GPUs are done earning
+# their $14.7/h — a dead supervisor that leaves the box billing idle cost ~$200 once (14h,
+# 2026-08-02: disk full at ckpt-18000, restarts all failed, nobody was watching). Checkpoints
+# are already in GCS via the sync loop, so power off.
+sync; sudo shutdown -h +1 "training loop ended — powering off to stop billing"
