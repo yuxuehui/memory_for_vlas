@@ -243,6 +243,7 @@ class VarPyramidTokenizer(nn.Module):
         # it), which clears the flag. If they never arrive, forward() raises loudly instead of
         # silently encoding with random weights.
         self._weights_pending = False
+        self._var_ckpt_path = var_ckpt or ""
         if var_ckpt and os.path.isfile(var_ckpt):
             self._load_var_ckpt(var_ckpt)
         elif var_ckpt:
@@ -291,6 +292,38 @@ class VarPyramidTokenizer(nn.Module):
             if not torch.allclose(w, fp, atol=2e-2, rtol=5e-2):
                 module._weights_pending = False
 
+    def _ensure_shadow_materialized(self, live_w: torch.Tensor):
+        """Rebuild the fp32 shadow if __init__ built it from META tensors.
+
+        HF `from_pretrained(low_cpu_mem_usage=True)` constructs the module on the meta device,
+        so the shadow cloned in __init__ is meta too; HF then materialises the real weights via
+        `_load_state_dict_into_meta_model`, which ASSIGNS rather than calling
+        `module.load_state_dict()` — so the post-load hook that would refresh the shadow never
+        fires. The first bf16 forward then tried `meta_tensor.to(device)` and died with
+        "Cannot copy out of meta tensor". Training never hit this: there the module is built
+        normally, not through from_pretrained.
+
+        Preference order: the official VAR checkpoint if it is on this machine (true fp32),
+        otherwise the live weights (bf16-rounded, but correct values and far better than a
+        crash)."""
+        if not any(v.is_meta for v in self._fp32_sd.values()):
+            return
+        if self._var_ckpt_path and os.path.isfile(self._var_ckpt_path):
+            sd = torch.load(self._var_ckpt_path, map_location="cpu")
+            sd = sd.get("state_dict", sd)
+            drop = ("decoder.", "post_quant_conv.", "quantize.ema_vocab_hit_SV")
+            sd = {k: v.detach().float().clone()
+                  for k, v in sd.items() if not k.startswith(drop)}
+            if set(sd) >= {k for k in self._fp32_sd if not k.endswith("ema_vocab_hit_SV")}:
+                self._fp32_sd = sd
+                logger.info("VarPyramidTokenizer: fp32 shadow rebuilt from %s (meta-init "
+                            "recovery)", self._var_ckpt_path)
+                return
+        self._fp32_sd = {k: v.detach().float().clone()
+                         for k, v in self.state_dict().items()}
+        logger.warning("VarPyramidTokenizer: fp32 shadow was meta and no VAR checkpoint is on "
+                       "this machine — rebuilt from the live (bf16-rounded) weights.")
+
     def _load_var_ckpt(self, path: str):
         sd = torch.load(path, map_location="cpu")
         sd = sd.get("state_dict", sd)
@@ -320,6 +353,7 @@ class VarPyramidTokenizer(nn.Module):
             # sees fp32 weights and takes the normal branch below (single bounded re-entry).
             # The shadow predates the cast, so full precision is preserved; move-only on device
             # change (rebuilding from the live weights would bake in the bf16 rounding).
+            self._ensure_shadow_materialized(w)
             ref = self._fp32_sd["quant_conv.weight"]
             if ref.device != w.device:
                 self._fp32_sd = {k: v.to(w.device) for k, v in self._fp32_sd.items()}
@@ -350,6 +384,7 @@ class VarPyramidTokenizer(nn.Module):
         the stored-code round-trip; the fp32 shadow predates any cast)."""
         w = self.quantize.embedding.weight
         if w.dtype != torch.float32:
+            self._ensure_shadow_materialized(w)
             return self._fp32_sd["quantize.embedding.weight"].to(w.device)
         return w
 
